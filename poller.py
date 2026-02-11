@@ -208,6 +208,10 @@ def calc_autocopy_amount(trader_usdc: float, trader_address: str, price: float =
         if amount < min_cost:
             amount = min_cost
 
+    # Ensure minimum $1 for marketable orders
+    if amount < 1.0:
+        amount = 1.0
+
     return amount
 
 
