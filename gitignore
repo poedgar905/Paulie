@@ -1,0 +1,5 @@
+-e tracker.db
+__pycache__/
+.env
+credentials.json
+*.pyc
