@@ -17,7 +17,8 @@ from database import (
     init_db, add_trader, remove_trader, get_all_traders, update_trader,
     seed_existing_trades, save_copy_trade, get_display_name,
     set_nickname, set_autocopy, set_autocopy_tags, find_trader_by_name,
-    get_all_open_copy_trades,
+    get_all_open_copy_trades, close_copy_trade, update_copy_trade_status,
+    get_all_pending_copy_trades,
 )
 from polymarket_api import (
     extract_address_or_username, resolve_username_to_address,
@@ -503,36 +504,42 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /cleanup ───────────────────────────────────────────────────
 @owner_only
 async def cleanup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove ghost trades from DB — orders that never filled. Cancel live orders."""
+    """Cancel live orders, clean ghost trades."""
     from trading import check_order_status, cancel_order
+    from database import get_all_pending_copy_trades, update_copy_trade_status
 
+    # Clean OPEN trades
     copies = get_all_open_copy_trades()
-    if not copies:
-        await update.message.reply_text("✅ Нема відкритих копі-трейдів.")
+    pending = get_all_pending_copy_trades()
+    all_trades = copies + pending
+
+    if not all_trades:
+        await update.message.reply_text("✅ Нема відкритих/pending копі-трейдів.")
         return
 
-    msg = await update.message.reply_text(f"🧹 Перевіряю {len(copies)} позицій...")
+    msg = await update.message.reply_text(f"🧹 Перевіряю {len(all_trades)} позицій...")
 
     cleaned = 0
     cancelled = 0
     real_positions = 0
 
-    for c in copies:
+    for c in all_trades:
         order_id = c.get("order_id", "")
+        current_status = c.get("status", "OPEN")
+
         if order_id:
             status = check_order_status(order_id)
             status_lower = status.lower() if status else ""
 
             if status_lower == "matched":
+                if current_status == "PENDING":
+                    update_copy_trade_status(c["id"], "OPEN")
                 real_positions += 1
             elif status_lower == "live":
-                # Cancel hanging order and remove from DB
                 cancel_order(order_id)
-                from database import close_copy_trade
-                close_copy_trade(c["id"], 0, 0, int(time.time()), pnl_usdc=0, pnl_pct=0)
+                update_copy_trade_status(c["id"], "CANCELLED")
                 cancelled += 1
             else:
-                from database import close_copy_trade
                 close_copy_trade(c["id"], 0, 0, int(time.time()), pnl_usdc=0, pnl_pct=0)
                 cleaned += 1
         else:
@@ -912,6 +919,11 @@ async def post_init(app: Application):
     asyncio.create_task(poll_traders(app.bot))
     logger.info("Poller task created")
 
+    # Start order checker (PENDING → OPEN/CANCELLED)
+    from poller import check_pending_orders
+    asyncio.create_task(check_pending_orders(app.bot))
+    logger.info("Order checker task created")
+
     # Start Google Sheets updater
     try:
         from sheets import sheets_updater
@@ -928,7 +940,7 @@ async def post_init(app: Application):
     try:
         await app.bot.send_message(
             chat_id=OWNER_ID,
-            text=f"🤖 <b>Bot started!</b>\n⏱ Polling: 15s\n📊 Sheets: 5min\n🏥 Health: 5min\n💰 Trading: {trading}",
+            text=f"🤖 <b>Bot started!</b>\n⏱ Polling: 15s\n🔄 Order check: 30s\n📊 Sheets: 5min\n🏥 Health: 5min\n💰 Trading: {trading}",
             parse_mode=ParseMode.HTML,
         )
     except Exception:
