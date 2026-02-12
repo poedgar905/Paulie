@@ -397,15 +397,16 @@ def save_copy_trade(
     buy_price: float, usdc_spent: float, shares: float,
     order_id: str | None, timestamp: int, title: str | None = None,
     hashtag: str | None = None, source: str = "manual",
+    status: str = "OPEN",
 ) -> int:
     conn = get_db()
     cursor = conn.execute(
         """INSERT INTO copy_trades
            (trader_address, condition_id, token_id, outcome, buy_price, usdc_spent,
-            shares, order_id, timestamp, title, hashtag, source)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            shares, order_id, timestamp, title, hashtag, source, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (trader_address.lower(), condition_id, token_id, outcome, buy_price,
-         usdc_spent, shares, order_id, timestamp, title, hashtag, source)
+         usdc_spent, shares, order_id, timestamp, title, hashtag, source, status)
     )
     conn.commit()
     row_id = cursor.lastrowid
@@ -422,6 +423,34 @@ def find_open_copy_trades(trader_address: str, condition_id: str, outcome: str) 
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def find_pending_copy_trades(trader_address: str, condition_id: str, outcome: str) -> list[dict]:
+    """Find PENDING copy trades for a specific market (not yet filled)."""
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT * FROM copy_trades
+           WHERE trader_address = ? AND condition_id = ? AND outcome = ? AND status = 'PENDING'""",
+        (trader_address.lower(), condition_id, outcome)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_all_pending_copy_trades() -> list[dict]:
+    """Get ALL pending copy trades across all traders."""
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM copy_trades WHERE status = 'PENDING'").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def update_copy_trade_status(copy_id: int, status: str):
+    """Update status: PENDING → OPEN, PENDING → CANCELLED, etc."""
+    conn = get_db()
+    conn.execute("UPDATE copy_trades SET status = ? WHERE id = ?", (status, copy_id))
+    conn.commit()
+    conn.close()
 
 
 def close_copy_trade(copy_id: int, sell_price: float, sell_usdc: float, sell_timestamp: int,
@@ -453,6 +482,18 @@ def get_closed_copy_trades(limit: int = 50) -> list[dict]:
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def has_trader_sold(trader_address: str, condition_id: str, outcome: str) -> bool:
+    """Check if trader already sold this market (buy_messages closed)."""
+    conn = get_db()
+    row = conn.execute(
+        """SELECT COUNT(*) as cnt FROM buy_messages
+           WHERE trader_address = ? AND condition_id = ? AND outcome = ? AND closed = 1""",
+        (trader_address.lower(), condition_id, outcome)
+    ).fetchone()
+    conn.close()
+    return row["cnt"] > 0 if row else False
 
 
 def get_copy_trades_by_hashtag() -> list[dict]:
