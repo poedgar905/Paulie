@@ -248,8 +248,20 @@ async def poll_traders(bot: Bot):
                             logger.error(f"Poll error {address}: {e}")
                         await asyncio.sleep(0.5)
 
+            # Report success to health monitor
+            try:
+                from bot import report_poll_success
+                report_poll_success()
+            except Exception:
+                pass
+
         except Exception as e:
             logger.error(f"Poller error: {e}")
+            try:
+                from bot import report_poll_error
+                report_poll_error()
+            except Exception:
+                pass
 
         await asyncio.sleep(POLL_INTERVAL)
 
