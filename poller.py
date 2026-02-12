@@ -240,9 +240,11 @@ async def poll_traders(bot: Bot):
                                 tx = act.get("transactionHash", "")
                                 if not tx:
                                     continue
-                                if not is_trade_seen(address, tx):
+                                cid = act.get("conditionId", "")
+                                side = act.get("side", "")
+                                if not is_trade_seen(address, tx, cid, side):
                                     new_trades.append(act)
-                                    mark_trade_seen(address, tx, int(act.get("timestamp", time.time())))
+                                    mark_trade_seen(address, tx, int(act.get("timestamp", time.time())), cid, side)
 
                             for trade in sorted(new_trades, key=lambda x: int(x.get("timestamp", 0))):
                                 await _send_notification(bot, trade, address, display_name, is_autocopy)
