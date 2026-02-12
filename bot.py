@@ -415,16 +415,16 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     position_lines = []
 
     if copies:
-        for c in copies:
-            invested = float(c.get("usdc_spent", 0))
-            total_invested += invested
+        async with aiohttp.ClientSession() as session:
+            for c in copies:
+                invested = float(c.get("usdc_spent", 0))
+                total_invested += invested
 
-            # Get current price
-            token_id = c.get("token_id", "")
-            cur_price = None
-            if token_id:
-                try:
-                    async with aiohttp.ClientSession() as session:
+                # Get current price
+                token_id = c.get("token_id", "")
+                cur_price = None
+                if token_id:
+                    try:
                         url = f"https://clob.polymarket.com/midpoint?token_id={token_id}"
                         async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                             if resp.status == 200:
@@ -432,27 +432,27 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 mid = data.get("mid")
                                 if mid:
                                     cur_price = float(mid)
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
 
-            shares = float(c.get("shares", 0))
-            if cur_price:
-                cur_val = shares * cur_price
-                unrealized = cur_val - invested
-                total_current += cur_val
-                total_unrealized += unrealized
-                sign = "+" if unrealized >= 0 else ""
-                emoji = "🟩" if unrealized >= 0 else "🟥"
-                position_lines.append(
-                    f"  {emoji} {c.get('title', '?')[:35]}\n"
-                    f"     {_usd(invested)} → {_usd(cur_val)} ({sign}{_usd(unrealized)})"
-                )
-            else:
-                total_current += invested  # fallback
-                position_lines.append(
-                    f"  ❓ {c.get('title', '?')[:35]}\n"
-                    f"     {_usd(invested)} (ціна невідома)"
-                )
+                shares = float(c.get("shares", 0))
+                if cur_price:
+                    cur_val = shares * cur_price
+                    unrealized = cur_val - invested
+                    total_current += cur_val
+                    total_unrealized += unrealized
+                    sign = "+" if unrealized >= 0 else ""
+                    emoji = "🟩" if unrealized >= 0 else "🟥"
+                    position_lines.append(
+                        f"  {emoji} {c.get('title', '?')[:35]}\n"
+                        f"     {_usd(invested)} → {_usd(cur_val)} ({sign}{_usd(unrealized)})"
+                    )
+                else:
+                    total_current += invested  # fallback
+                    position_lines.append(
+                        f"  ❓ {c.get('title', '?')[:35]}\n"
+                        f"     {_usd(invested)} (ціна невідома)"
+                    )
 
     # Closed P&L
     from database import get_closed_copy_trades
@@ -540,6 +540,25 @@ async def cleanup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Реальні позиції: {real_positions}\n"
         f"⏳ Активні лімітки: {live_orders}\n"
         f"🗑 Видалено привидів: {cleaned}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── /reset_pnl ─────────────────────────────────────────────────
+@owner_only
+async def reset_pnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clear all fake P&L data from ghost trades."""
+    from database import get_db
+    conn = get_db()
+    # Delete all closed copy trades (they're mostly ghosts from cleanup)
+    cursor = conn.execute("DELETE FROM copy_trades WHERE status = 'CLOSED'")
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(
+        f"🧹 <b>P&L Reset!</b>\n\n"
+        f"Видалено {deleted} закритих записів.\n"
+        f"Тепер /balance покаже чисту статистику.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -971,6 +990,7 @@ def main():
     app.add_handler(CommandHandler("check", check_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("cleanup", cleanup_cmd))
+    app.add_handler(CommandHandler("reset_pnl", reset_pnl_cmd))
     app.add_handler(CommandHandler("portfolio", portfolio_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_amount_handler))
