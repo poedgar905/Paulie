@@ -344,7 +344,7 @@ async def _send_notification(bot: Bot, trade: dict, address: str, display_name: 
 
         # ── AUTOCOPY ──
         if is_autocopy and is_trading_enabled():
-            await _handle_autocopy_buy(bot, trade, address, display_name, hashtag, order_type)
+            await _handle_autocopy_buy(bot, trade, address, display_name, hashtag)
 
     elif trade_type == "TRADE" and side == "SELL":
         buys = find_all_open_buys(address, condition_id, outcome)
@@ -454,8 +454,8 @@ async def _send_notification(bot: Bot, trade: dict, address: str, display_name: 
 
 # ── Autocopy BUY handler ────────────────────────────────────────
 
-async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trader_name: str, hashtag: str, order_type: str = "❓"):
-    """Automatically copy a BUY trade based on size rules."""
+async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trader_name: str, hashtag: str):
+    """Automatically copy a BUY trade — GTC at trader's price, cancel if not filled in 5s."""
     from database import get_autocopy_tags
 
     # Check if hashtag is allowed for this trader's autocopy
@@ -470,9 +470,6 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
     token_id = trade.get("asset", "")
     title = trade.get("title", "")
 
-    # Determine if trader used a limit order
-    is_limit = "📋" in order_type  # 📋 = Limit, 📊 = Market
-
     amount = calc_autocopy_amount(trader_usdc, trader_address, price)
     if amount is None:
         logger.info("Autocopy skip: $50+ limit reached for %s today", trader_name)
@@ -486,11 +483,6 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
     if amount < 0.01:
         return
 
-    # For limit orders: don't enforce $1 minimum (postOnly has no minimum)
-    if is_limit and amount < 1.0:
-        # Keep the small amount — postOnly allows it
-        pass
-
     # Resolve token_id
     if not token_id:
         token_id = get_token_id_for_market(condition_id, outcome) or ""
@@ -498,30 +490,35 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
         logger.error("Autocopy: no token_id for %s", title)
         return
 
-    # Limit → postOnly (sits in book), Market → GTC (executes now)
-    result = place_limit_buy(token_id, price, amount, condition_id, post_only=is_limit)
-    order_label = "📋 Limit" if is_limit else "📊 Market"
+    # GTC at trader's price
+    result = place_limit_buy(token_id, price, amount, condition_id)
 
     if result:
         shares = result["size"]
         order_id = result.get("order_id", "")
 
-        # For postOnly orders, verify it actually went live (not rejected)
-        if is_limit and order_id:
-            await asyncio.sleep(2)  # Wait 2s for order to settle
-            from trading import check_order_status
+        # Wait 5s and check if order filled. If still live → cancel (no liquidity at that price)
+        if order_id:
+            await asyncio.sleep(5)
+            from trading import check_order_status, cancel_order
             status = check_order_status(order_id)
-            if status and status not in ("live", "matched", "filled"):
-                logger.warning("Autocopy postOnly order %s rejected (status: %s)", order_id, status)
+            if status == "live":
+                # Not filled — cancel, don't save to DB
+                cancel_order(order_id)
+                logger.info("Autocopy cancelled unfilled order %s for %s", order_id, title)
                 await bot.send_message(
                     chat_id=OWNER_ID,
                     text=(
-                        f"⏭ <b>Autocopy skipped</b> — лімітка відхилена\n"
+                        f"⏭ <b>Autocopy skipped</b> — нема ліквідності\n"
                         f"📌 {title[:50]}\n"
-                        f"Status: {status}"
+                        f"🎯 {outcome} @ {_price(price)}\n"
+                        f"Ордер скасовано (ціни вже нема)"
                     ),
                     parse_mode=ParseMode.HTML,
                 )
+                return
+            elif status and status not in ("matched", "filled", "closed"):
+                logger.warning("Autocopy order %s unexpected status: %s", order_id, status)
                 return
 
         # Track $50+ trades
@@ -548,7 +545,7 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
             text=(
                 f"🤖 <b>AUTOCOPY</b> — copying {trader_name}\n\n"
                 f"📌 <b>{title}</b>\n"
-                f"🎯 BUY {outcome} @ {_price(price)} ({order_label})\n"
+                f"🎯 BUY {outcome} @ {_price(price)}\n"
                 f"💵 {_usd(amount)} ({_shares(shares)} shares)\n"
                 f"👤 Trader put: {_usd(trader_usdc)}\n\n"
                 f"🤖 Will auto-sell when {trader_name} exits."
@@ -557,7 +554,7 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
         )
         # Forward to channel
         await _send_to_channel(bot,
-            f"🟢 <b>AUTOCOPY BUY</b> ({order_label})\n\n"
+            f"🟢 <b>AUTOCOPY BUY</b>\n\n"
             f"📌 <b>{title}</b>\n"
             f"🎯 {outcome} @ {_price(price)}\n"
             f"💵 {_usd(amount)} ({_shares(shares)} shares)\n"
