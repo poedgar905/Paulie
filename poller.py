@@ -496,6 +496,24 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
         shares = result["size"]
         order_id = result.get("order_id", "")
 
+        # For postOnly orders, verify it actually went live (not rejected)
+        if is_limit and order_id:
+            await asyncio.sleep(2)  # Wait 2s for order to settle
+            from trading import check_order_status
+            status = check_order_status(order_id)
+            if status and status not in ("live", "matched", "filled"):
+                logger.warning("Autocopy postOnly order %s rejected (status: %s)", order_id, status)
+                await bot.send_message(
+                    chat_id=OWNER_ID,
+                    text=(
+                        f"⏭ <b>Autocopy skipped</b> — лімітка відхилена\n"
+                        f"📌 {title[:50]}\n"
+                        f"Status: {status}"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+
         # Track $50+ trades
         if trader_usdc >= 50:
             increment_daily_big_trade(trader_address)
