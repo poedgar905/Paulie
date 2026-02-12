@@ -216,6 +216,14 @@ def calc_autocopy_amount(trader_usdc: float, trader_address: str, price: float =
 pending_copy_data: dict[str, dict] = {}
 
 
+def _clean_pending_data():
+    """Remove entries older than 1 hour."""
+    now = time.time()
+    expired = [k for k, v in pending_copy_data.items() if now - v.get("_ts", 0) > 3600]
+    for k in expired:
+        del pending_copy_data[k]
+
+
 # ── Main poller ──────────────────────────────────────────────────
 
 async def poll_traders(bot: Bot):
@@ -223,6 +231,7 @@ async def poll_traders(bot: Bot):
 
     while True:
         try:
+            _clean_pending_data()  # Remove expired copy-trade buttons
             traders = get_all_traders()
             if traders:
                 async with aiohttp.ClientSession() as session:
@@ -307,6 +316,7 @@ async def _send_notification(bot: Bot, trade: dict, address: str, display_name: 
                 "slug": trade.get("slug", ""),
                 "event_slug": trade.get("eventSlug", ""),
                 "hashtag": hashtag,
+                "_ts": time.time(),
             }
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("💰 Copy Trade", callback_data=f"ct:{trade_hash}"),
