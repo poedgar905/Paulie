@@ -26,7 +26,9 @@ def init_db():
             trader_address TEXT NOT NULL,
             transaction_hash TEXT NOT NULL,
             timestamp INTEGER NOT NULL,
-            UNIQUE(trader_address, transaction_hash)
+            condition_id TEXT DEFAULT '',
+            side TEXT DEFAULT '',
+            UNIQUE(trader_address, transaction_hash, condition_id, side)
         );
         CREATE TABLE IF NOT EXISTS buy_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,6 +116,30 @@ def _migrate(conn):
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
             except sqlite3.OperationalError:
                 pass
+
+    # Migrate seen_trades: add condition_id + side columns for proper dedup
+    st_cols = {c["name"] for c in conn.execute("PRAGMA table_info(seen_trades)").fetchall()}
+    if "condition_id" not in st_cols:
+        try:
+            # SQLite can't alter UNIQUE constraints, so recreate the table
+            conn.executescript("""
+                CREATE TABLE seen_trades_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trader_address TEXT NOT NULL,
+                    transaction_hash TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    condition_id TEXT DEFAULT '',
+                    side TEXT DEFAULT '',
+                    UNIQUE(trader_address, transaction_hash, condition_id, side)
+                );
+                INSERT INTO seen_trades_new (trader_address, transaction_hash, timestamp, condition_id, side)
+                    SELECT trader_address, transaction_hash, timestamp, '', '' FROM seen_trades;
+                DROP TABLE seen_trades;
+                ALTER TABLE seen_trades_new RENAME TO seen_trades;
+            """)
+        except sqlite3.OperationalError as e:
+            import logging
+            logging.getLogger(__name__).error("seen_trades migration error: %s", e)
 
 
 # ── Traders ──────────────────────────────────────────────────────
@@ -264,22 +290,22 @@ def increment_daily_big_trade(address: str):
 
 # ── Seen trades ──────────────────────────────────────────────────
 
-def is_trade_seen(trader_address: str, tx_hash: str) -> bool:
+def is_trade_seen(trader_address: str, tx_hash: str, condition_id: str = "", side: str = "") -> bool:
     conn = get_db()
     row = conn.execute(
-        "SELECT 1 FROM seen_trades WHERE trader_address = ? AND transaction_hash = ?",
-        (trader_address.lower(), tx_hash)
+        "SELECT 1 FROM seen_trades WHERE trader_address = ? AND transaction_hash = ? AND condition_id = ? AND side = ?",
+        (trader_address.lower(), tx_hash, condition_id, side)
     ).fetchone()
     conn.close()
     return row is not None
 
 
-def mark_trade_seen(trader_address: str, tx_hash: str, timestamp: int):
+def mark_trade_seen(trader_address: str, tx_hash: str, timestamp: int, condition_id: str = "", side: str = ""):
     conn = get_db()
     try:
         conn.execute(
-            "INSERT OR IGNORE INTO seen_trades (trader_address, transaction_hash, timestamp) VALUES (?, ?, ?)",
-            (trader_address.lower(), tx_hash, timestamp)
+            "INSERT OR IGNORE INTO seen_trades (trader_address, transaction_hash, timestamp, condition_id, side) VALUES (?, ?, ?, ?, ?)",
+            (trader_address.lower(), tx_hash, timestamp, condition_id, side)
         )
         conn.commit()
     finally:
@@ -289,7 +315,7 @@ def mark_trade_seen(trader_address: str, tx_hash: str, timestamp: int):
 def seed_existing_trades(trader_address: str, tx_hashes: list[tuple[str, int]]):
     conn = get_db()
     conn.executemany(
-        "INSERT OR IGNORE INTO seen_trades (trader_address, transaction_hash, timestamp) VALUES (?, ?, ?)",
+        "INSERT OR IGNORE INTO seen_trades (trader_address, transaction_hash, timestamp, condition_id, side) VALUES (?, ?, ?, '', '')",
         [(trader_address.lower(), tx, ts) for tx, ts in tx_hashes]
     )
     conn.commit()
