@@ -25,7 +25,7 @@ FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS", "0xE433Db358AeD293216F77124E800dC97
 SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "2"))
 
 # ── Polling ──────────────────────────────────────────────────────
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "15"))  # 15 seconds
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "3"))  # 3 seconds
 
 # ── Database ─────────────────────────────────────────────────────
 DB_PATH = os.getenv("DB_PATH", "tracker.db")
