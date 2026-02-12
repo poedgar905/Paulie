@@ -455,7 +455,7 @@ async def _send_notification(bot: Bot, trade: dict, address: str, display_name: 
 # ── Autocopy BUY handler ────────────────────────────────────────
 
 async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trader_name: str, hashtag: str):
-    """Automatically copy a BUY trade — GTC at trader's price, cancel if not filled in 5s."""
+    """Automatically copy a BUY trade — place GTC at trader's price and save."""
     from database import get_autocopy_tags
 
     # Check if hashtag is allowed for this trader's autocopy
@@ -490,42 +490,11 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
         logger.error("Autocopy: no token_id for %s", title)
         return
 
-    # GTC at trader's price
     result = place_limit_buy(token_id, price, amount, condition_id)
 
     if result:
         shares = result["size"]
         order_id = result.get("order_id", "")
-
-        # Wait 5s and check if order filled. If still live → cancel (no liquidity at that price)
-        if order_id:
-            await asyncio.sleep(5)
-            from trading import check_order_status, cancel_order
-            status = check_order_status(order_id)
-            if status:
-                status_lower = status.lower()
-            else:
-                status_lower = ""
-
-            if status_lower == "live":
-                # Not filled — cancel, don't save to DB
-                cancel_order(order_id)
-                logger.info("Autocopy cancelled unfilled order %s for %s", order_id, title)
-                await bot.send_message(
-                    chat_id=OWNER_ID,
-                    text=(
-                        f"⏭ <b>Autocopy skipped</b> — нема ліквідності\n"
-                        f"📌 {title[:50]}\n"
-                        f"🎯 {outcome} @ {_price(price)}\n"
-                        f"Ордер скасовано (ціни вже нема)"
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
-                return
-            elif status_lower not in ("matched", "filled", "closed", ""):
-                logger.warning("Autocopy order %s unexpected status: %s", order_id, status)
-                cancel_order(order_id)
-                return
 
         # Track $50+ trades
         if trader_usdc >= 50:
