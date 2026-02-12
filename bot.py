@@ -485,10 +485,19 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     if position_lines:
-        lines.append(f"\n<b>Відкриті позиції:</b>")
-        lines.extend(position_lines)
+        lines.append(f"\n<b>Відкриті позиції ({len(position_lines)}):</b>")
+        # Show max 10 positions to avoid Message_too_long
+        for pl in position_lines[:10]:
+            lines.append(pl)
+        if len(position_lines) > 10:
+            lines.append(f"  ... і ще {len(position_lines) - 10}")
 
-    await msg.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    text = "\n".join(lines)
+    # Telegram max is 4096 chars
+    if len(text) > 4000:
+        text = text[:4000] + "\n\n... (обрізано)"
+
+    await msg.edit_text(text, parse_mode=ParseMode.HTML)
 
 
 # ── Callback handler ────────────────────────────────────────────
