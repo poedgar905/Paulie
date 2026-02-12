@@ -132,10 +132,6 @@ def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_i
         # size = number of shares = amount_usdc / price
         size = round(amount_usdc / price, 2)
 
-        # Minimum 5 shares (Polymarket requirement)
-        if size < 5:
-            size = 5.0
-
         # Round price to valid tick (0.01)
         price = round(price, 2)
         if price <= 0 or price >= 1:
