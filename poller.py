@@ -208,10 +208,6 @@ def calc_autocopy_amount(trader_usdc: float, trader_address: str, price: float =
         if amount < min_cost:
             amount = min_cost
 
-    # Ensure minimum $1 for marketable orders
-    if amount < 1.0:
-        amount = 1.0
-
     return amount
 
 
@@ -326,7 +322,7 @@ async def _send_notification(bot: Bot, trade: dict, address: str, display_name: 
 
         # ── AUTOCOPY ──
         if is_autocopy and is_trading_enabled():
-            await _handle_autocopy_buy(bot, trade, address, display_name, hashtag)
+            await _handle_autocopy_buy(bot, trade, address, display_name, hashtag, order_type)
 
     elif trade_type == "TRADE" and side == "SELL":
         buys = find_all_open_buys(address, condition_id, outcome)
@@ -436,7 +432,7 @@ async def _send_notification(bot: Bot, trade: dict, address: str, display_name: 
 
 # ── Autocopy BUY handler ────────────────────────────────────────
 
-async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trader_name: str, hashtag: str):
+async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trader_name: str, hashtag: str, order_type: str = "❓"):
     """Automatically copy a BUY trade based on size rules."""
     from database import get_autocopy_tags
 
@@ -452,6 +448,9 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
     token_id = trade.get("asset", "")
     title = trade.get("title", "")
 
+    # Determine if trader used a limit order
+    is_limit = "📋" in order_type  # 📋 = Limit, 📊 = Market
+
     amount = calc_autocopy_amount(trader_usdc, trader_address, price)
     if amount is None:
         logger.info("Autocopy skip: $50+ limit reached for %s today", trader_name)
@@ -465,6 +464,11 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
     if amount < 0.01:
         return
 
+    # For limit orders: don't enforce $1 minimum (postOnly has no minimum)
+    if is_limit and amount < 1.0:
+        # Keep the small amount — postOnly allows it
+        pass
+
     # Resolve token_id
     if not token_id:
         token_id = get_token_id_for_market(condition_id, outcome) or ""
@@ -472,7 +476,9 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
         logger.error("Autocopy: no token_id for %s", title)
         return
 
-    result = place_limit_buy(token_id, price, amount, condition_id)
+    # Limit → postOnly (sits in book), Market → GTC (executes now)
+    result = place_limit_buy(token_id, price, amount, condition_id, post_only=is_limit)
+    order_label = "📋 Limit" if is_limit else "📊 Market"
 
     if result:
         shares = result["size"]
@@ -502,7 +508,7 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
             text=(
                 f"🤖 <b>AUTOCOPY</b> — copying {trader_name}\n\n"
                 f"📌 <b>{title}</b>\n"
-                f"🎯 BUY {outcome} @ {_price(price)}\n"
+                f"🎯 BUY {outcome} @ {_price(price)} ({order_label})\n"
                 f"💵 {_usd(amount)} ({_shares(shares)} shares)\n"
                 f"👤 Trader put: {_usd(trader_usdc)}\n\n"
                 f"🤖 Will auto-sell when {trader_name} exits."
@@ -511,7 +517,7 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
         )
         # Forward to channel
         await _send_to_channel(bot,
-            f"🟢 <b>AUTOCOPY BUY</b>\n\n"
+            f"🟢 <b>AUTOCOPY BUY</b> ({order_label})\n\n"
             f"📌 <b>{title}</b>\n"
             f"🎯 {outcome} @ {_price(price)}\n"
             f"💵 {_usd(amount)} ({_shares(shares)} shares)\n"
