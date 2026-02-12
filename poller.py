@@ -380,8 +380,11 @@ async def _send_notification(bot: Bot, trade: dict, address: str, display_name: 
                              sell_price=sell_price, sell_usdc=sell_usdc,
                              pnl_usdc=pnl_usdc, pnl_pct=pnl_pct)
 
-        # Auto-sell copy trades
+        # Auto-sell copy trades (OPEN ones)
         await _auto_sell_copies(bot, address, condition_id, outcome, trade)
+
+        # Cancel any PENDING orders for this market (trader already exited)
+        await _cancel_pending_copies(bot, address, condition_id, outcome)
 
     elif trade_type == "REDEEM":
         buys = find_all_open_buys(address, condition_id, outcome)
@@ -443,6 +446,7 @@ async def _send_notification(bot: Bot, trade: dict, address: str, display_name: 
                              sell_price=1.0, sell_usdc=sell_usdc,
                              pnl_usdc=pnl_usdc, pnl_pct=pnl_pct)
         await _auto_sell_copies(bot, address, condition_id, outcome, trade)
+        await _cancel_pending_copies(bot, address, condition_id, outcome)
 
     else:
         msg_text = format_other_message(trade, display_name)
@@ -513,6 +517,7 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
             title=title,
             hashtag=hashtag,
             source="autocopy",
+            status="PENDING",
         )
 
         await bot.send_message(
@@ -615,3 +620,101 @@ async def _auto_sell_copies(bot: Bot, trader_address: str, condition_id: str, ou
                 )
         except Exception as e:
             logger.error(f"Auto-sell error: {e}")
+
+
+# ── Cancel PENDING orders when trader exits ──────────────────────
+
+async def _cancel_pending_copies(bot: Bot, trader_address: str, condition_id: str, outcome: str):
+    """Cancel PENDING copy trades when trader sells — no point keeping limit order."""
+    from database import find_pending_copy_trades, update_copy_trade_status
+    from trading import cancel_order
+
+    pending = find_pending_copy_trades(trader_address, condition_id, outcome)
+    for p in pending:
+        order_id = p.get("order_id", "")
+        if order_id:
+            cancel_order(order_id)
+        update_copy_trade_status(p["id"], "CANCELLED")
+        logger.info("Cancelled PENDING copy trade %s (trader exited)", p.get("title", "?")[:40])
+
+
+# ── Background order checker ─────────────────────────────────────
+
+async def check_pending_orders(bot: Bot):
+    """Background task: check PENDING orders every 30s.
+    - MATCHED → OPEN (+ check if trader already sold → auto-sell)
+    - LIVE > 2 min → cancel + CANCELLED
+    """
+    from database import (
+        get_all_pending_copy_trades, update_copy_trade_status,
+        has_trader_sold, get_all_traders,
+    )
+    from trading import check_order_status, cancel_order
+
+    logger.info("Order checker started (30s interval)")
+    await asyncio.sleep(30)  # Wait before first check
+
+    while True:
+        try:
+            pending = get_all_pending_copy_trades()
+            traders = {t["address"]: get_display_name(t) for t in get_all_traders()}
+
+            for p in pending:
+                order_id = p.get("order_id", "")
+                if not order_id:
+                    update_copy_trade_status(p["id"], "CANCELLED")
+                    continue
+
+                status = check_order_status(order_id)
+                status_lower = status.lower() if status else ""
+                age = time.time() - int(p.get("timestamp", time.time()))
+
+                if status_lower == "matched":
+                    # Order filled! Move to OPEN
+                    update_copy_trade_status(p["id"], "OPEN")
+                    trader_name = traders.get(p["trader_address"], "?")
+                    logger.info("PENDING → OPEN: %s (%s)", p.get("title", "?")[:40], trader_name)
+
+                    await bot.send_message(
+                        chat_id=OWNER_ID,
+                        text=(
+                            f"✅ <b>Ордер заповнився!</b>\n"
+                            f"📌 {p.get('title', '?')[:50]}\n"
+                            f"🎯 {p['outcome']} @ {_price(p['buy_price'])}\n"
+                            f"💵 {_usd(p['usdc_spent'])} ({_shares(p['shares'])} shares)"
+                        ),
+                        parse_mode=ParseMode.HTML,
+                    )
+
+                    # Check if trader already sold this market
+                    if has_trader_sold(p["trader_address"], p["condition_id"], p["outcome"]):
+                        logger.info("Trader already sold — auto-selling filled order")
+                        result = place_market_sell(p["token_id"], float(p["shares"]), p["condition_id"])
+                        if result:
+                            close_copy_trade(p["id"], 0, 0, int(time.time()), pnl_usdc=0, pnl_pct=0)
+                            await bot.send_message(
+                                chat_id=OWNER_ID,
+                                text=(
+                                    f"🤖 <b>AUTO-SOLD</b> (трейдер вже вийшов)\n"
+                                    f"📌 {p.get('title', '?')[:50]}"
+                                ),
+                                parse_mode=ParseMode.HTML,
+                            )
+
+                elif status_lower == "live" and age > 120:
+                    # Still live after 2 min → cancel
+                    cancel_order(order_id)
+                    update_copy_trade_status(p["id"], "CANCELLED")
+                    logger.info("PENDING → CANCELLED (timeout): %s", p.get("title", "?")[:40])
+
+                elif status_lower not in ("live", "matched", ""):
+                    # Unexpected status (cancelled externally, expired, etc)
+                    update_copy_trade_status(p["id"], "CANCELLED")
+                    logger.info("PENDING → CANCELLED (status %s): %s", status, p.get("title", "?")[:40])
+
+                await asyncio.sleep(0.3)  # Don't hammer API
+
+        except Exception as e:
+            logger.error(f"Order checker error: {e}")
+
+        await asyncio.sleep(30)
