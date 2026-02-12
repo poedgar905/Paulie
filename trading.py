@@ -254,3 +254,48 @@ def place_market_sell(token_id: str, size: float, condition_id: str = "") -> dic
     except Exception as e:
         logger.error("Error placing market SELL: %s", e)
         return None
+
+
+def check_order_status(order_id: str) -> str | None:
+    """
+    Check status of an order. Returns: 'live', 'matched', 'cancelled', etc.
+    Returns None on error.
+    """
+    client = _get_client()
+    if not client:
+        return None
+    try:
+        resp = client.get_order(order_id)
+        return resp.get("status", None)
+    except Exception as e:
+        logger.error("Error checking order %s: %s", order_id, e)
+        return None
+
+
+def get_open_orders() -> list:
+    """Get all open/live orders from CLOB."""
+    client = _get_client()
+    if not client:
+        return []
+    try:
+        resp = client.get_orders()
+        if isinstance(resp, list):
+            return resp
+        return []
+    except Exception as e:
+        logger.error("Error getting open orders: %s", e)
+        return []
+
+
+def cancel_order(order_id: str) -> bool:
+    """Cancel an open order."""
+    client = _get_client()
+    if not client:
+        return False
+    try:
+        resp = client.cancel(order_id)
+        logger.info("Cancelled order %s: %s", order_id, resp)
+        return True
+    except Exception as e:
+        logger.error("Error cancelling order %s: %s", order_id, e)
+        return False
