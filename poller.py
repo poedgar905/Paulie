@@ -502,7 +502,12 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
             await asyncio.sleep(5)
             from trading import check_order_status, cancel_order
             status = check_order_status(order_id)
-            if status == "live":
+            if status:
+                status_lower = status.lower()
+            else:
+                status_lower = ""
+
+            if status_lower == "live":
                 # Not filled — cancel, don't save to DB
                 cancel_order(order_id)
                 logger.info("Autocopy cancelled unfilled order %s for %s", order_id, title)
@@ -517,8 +522,9 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
                     parse_mode=ParseMode.HTML,
                 )
                 return
-            elif status and status not in ("matched", "filled", "closed"):
+            elif status_lower not in ("matched", "filled", "closed", ""):
                 logger.warning("Autocopy order %s unexpected status: %s", order_id, status)
+                cancel_order(order_id)
                 return
 
         # Track $50+ trades
