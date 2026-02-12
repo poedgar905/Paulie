@@ -597,10 +597,21 @@ async def _auto_sell_copies(bot: Bot, trader_address: str, condition_id: str, ou
                 # Forward to channel
                 await _send_to_channel(bot, msg)
             else:
+                # Sell failed — likely ghost trade (never filled or already sold)
+                # Close it in DB so it doesn't spam again
+                close_copy_trade(copy["id"], sell_price, 0, sell_ts,
+                               pnl_usdc=-invested, pnl_pct=-100)
+                logger.warning(f"Auto-sell failed for {copy.get('title', '?')}, closing ghost trade in DB")
                 await bot.send_message(
                     chat_id=OWNER_ID,
-                    text=f"⚠️ Auto-sell FAILED for {copy.get('title', '?')}. Manual action needed!",
+                    text=(
+                        f"⚠️ <b>Auto-sell FAILED</b>\n"
+                        f"📌 {copy.get('title', '?')[:50]}\n"
+                        f"💵 {_usd(invested)} ({_shares(shares)} shares)\n"
+                        f"❌ Закрив запис в БД (шейрів скоріш за все нема)\n"
+                        f"👉 Перевір позицію на polymarket.com"
+                    ),
+                    parse_mode=ParseMode.HTML,
                 )
         except Exception as e:
             logger.error(f"Auto-sell error: {e}")
-            await bot.send_message(chat_id=OWNER_ID, text=f"⚠️ Auto-sell error: {e}")
