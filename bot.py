@@ -503,7 +503,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /cleanup ───────────────────────────────────────────────────
 @owner_only
 async def cleanup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove ghost trades from DB — orders that never filled."""
+    """Remove ghost trades from DB — orders that never filled. Cancel live orders."""
     from trading import check_order_status, cancel_order
 
     copies = get_all_open_copy_trades()
@@ -514,31 +514,34 @@ async def cleanup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(f"🧹 Перевіряю {len(copies)} позицій...")
 
     cleaned = 0
-    live_orders = 0
+    cancelled = 0
     real_positions = 0
 
     for c in copies:
         order_id = c.get("order_id", "")
         if order_id:
             status = check_order_status(order_id)
-            if status == "matched":
+            status_lower = status.lower() if status else ""
+
+            if status_lower == "matched":
                 real_positions += 1
-            elif status == "live":
-                live_orders += 1
-            else:
-                # Order was cancelled, expired, or never filled
+            elif status_lower == "live":
+                # Cancel hanging order and remove from DB
+                cancel_order(order_id)
                 from database import close_copy_trade
-                close_copy_trade(c["id"], 0, 0, int(time.time()),
-                               pnl_usdc=-float(c.get("usdc_spent", 0)), pnl_pct=-100)
+                close_copy_trade(c["id"], 0, 0, int(time.time()), pnl_usdc=0, pnl_pct=0)
+                cancelled += 1
+            else:
+                from database import close_copy_trade
+                close_copy_trade(c["id"], 0, 0, int(time.time()), pnl_usdc=0, pnl_pct=0)
                 cleaned += 1
         else:
-            # No order_id — can't verify, keep it
             real_positions += 1
 
     await msg.edit_text(
         f"🧹 <b>Cleanup done!</b>\n\n"
         f"✅ Реальні позиції: {real_positions}\n"
-        f"⏳ Активні лімітки: {live_orders}\n"
+        f"❌ Скасовано ліміток: {cancelled}\n"
         f"🗑 Видалено привидів: {cleaned}",
         parse_mode=ParseMode.HTML,
     )
