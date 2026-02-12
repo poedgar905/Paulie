@@ -81,6 +81,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/nick <code>name NewNick</code> — Set nickname\n"
         f"/list — Watchlist\n"
         f"/check — Latest trades now\n"
+        f"/balance — Баланс і P&L\n"
         f"/portfolio — Your open copy-trades\n"
         f"/autocopy <code>name ON/OFF</code> — Auto copy-trading\n\n"
         f"🔄 Polls every 15 sec\n"
@@ -395,6 +396,99 @@ async def portfolio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"\n💰 Balance: {_usd(balance)}")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ── /balance ───────────────────────────────────────────────────
+@owner_only
+async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("💰 Рахую...")
+
+    # Cash balance
+    cash = get_balance()
+    cash_text = _usd(cash) if cash is not None else "❌ не вдалось"
+
+    # Open positions value
+    copies = get_all_open_copy_trades()
+    total_invested = 0.0
+    total_current = 0.0
+    total_unrealized = 0.0
+    position_lines = []
+
+    if copies:
+        for c in copies:
+            invested = float(c.get("usdc_spent", 0))
+            total_invested += invested
+
+            # Get current price
+            token_id = c.get("token_id", "")
+            cur_price = None
+            if token_id:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        url = f"https://clob.polymarket.com/midpoint?token_id={token_id}"
+                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                mid = data.get("mid")
+                                if mid:
+                                    cur_price = float(mid)
+                except Exception:
+                    pass
+
+            shares = float(c.get("shares", 0))
+            if cur_price:
+                cur_val = shares * cur_price
+                unrealized = cur_val - invested
+                total_current += cur_val
+                total_unrealized += unrealized
+                sign = "+" if unrealized >= 0 else ""
+                emoji = "🟩" if unrealized >= 0 else "🟥"
+                position_lines.append(
+                    f"  {emoji} {c.get('title', '?')[:35]}\n"
+                    f"     {_usd(invested)} → {_usd(cur_val)} ({sign}{_usd(unrealized)})"
+                )
+            else:
+                total_current += invested  # fallback
+                position_lines.append(
+                    f"  ❓ {c.get('title', '?')[:35]}\n"
+                    f"     {_usd(invested)} (ціна невідома)"
+                )
+
+    # Closed P&L
+    from database import get_closed_copy_trades
+    closed = get_closed_copy_trades(limit=999)
+    total_realized = sum(float(c.get("pnl_usdc", 0)) for c in closed)
+    total_closed_count = len(closed)
+    wins = sum(1 for c in closed if float(c.get("pnl_usdc", 0)) > 0)
+    winrate = (wins / total_closed_count * 100) if total_closed_count > 0 else 0
+
+    # Build message
+    total_value = (cash or 0) + total_current
+    lines = [
+        f"💰 <b>Баланс</b>\n",
+        f"💵 Кеш: <b>{cash_text}</b>",
+        f"📊 В угодах: <b>{_usd(total_current)}</b> ({len(copies)} позицій)",
+        f"💎 Всього: <b>{_usd(total_value)}</b>",
+    ]
+
+    if total_unrealized != 0:
+        sign = "+" if total_unrealized >= 0 else ""
+        emoji = "🟩" if total_unrealized >= 0 else "🟥"
+        lines.append(f"\n{emoji} Нереалізований P&L: <b>{sign}{_usd(total_unrealized)}</b>")
+
+    if total_closed_count > 0:
+        sign = "+" if total_realized >= 0 else ""
+        emoji = "🟩" if total_realized >= 0 else "🟥"
+        lines.append(
+            f"{emoji} Реалізований P&L: <b>{sign}{_usd(total_realized)}</b>"
+            f" ({total_closed_count} угод, {winrate:.0f}% win)"
+        )
+
+    if position_lines:
+        lines.append(f"\n<b>Відкриті позиції:</b>")
+        lines.extend(position_lines)
+
+    await msg.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # ── Callback handler ────────────────────────────────────────────
@@ -733,6 +827,7 @@ async def post_init(app: Application):
         BotCommand("nick", "✏️ Задати нікнейм"),
         BotCommand("list", "📋 Список трейдерів"),
         BotCommand("check", "🔍 Останні угоди"),
+        BotCommand("balance", "💰 Баланс і P&L"),
         BotCommand("portfolio", "💼 Мої копі-трейди"),
         BotCommand("autocopy", "🤖 Автокопітрейдинг"),
     ])
@@ -749,15 +844,80 @@ async def post_init(app: Application):
     except Exception as e:
         logger.warning("Sheets updater failed to start: %s", e)
 
+    # Start health monitor
+    asyncio.create_task(health_monitor(app.bot))
+    logger.info("Health monitor started")
+
     trading = "✅" if is_trading_enabled() else "❌ (no key)"
     try:
         await app.bot.send_message(
             chat_id=OWNER_ID,
-            text=f"🤖 <b>Bot started!</b>\n⏱ Polling: 15s\n📊 Sheets: 5min\n💰 Trading: {trading}",
+            text=f"🤖 <b>Bot started!</b>\n⏱ Polling: 15s\n📊 Sheets: 5min\n🏥 Health: 5min\n💰 Trading: {trading}",
             parse_mode=ParseMode.HTML,
         )
     except Exception:
         pass
+
+
+# ── Health monitor ──────────────────────────────────────────────
+
+_last_poll_time = 0
+_error_count = 0
+_consecutive_errors = 0
+
+def report_poll_success():
+    """Called by poller after each successful cycle."""
+    global _last_poll_time, _consecutive_errors
+    _last_poll_time = time.time()
+    _consecutive_errors = 0
+
+def report_poll_error():
+    """Called by poller on error."""
+    global _error_count, _consecutive_errors
+    _error_count += 1
+    _consecutive_errors += 1
+
+
+async def health_monitor(bot):
+    """Background task — checks bot health every 5 min."""
+    global _last_poll_time
+    _last_poll_time = time.time()
+
+    await asyncio.sleep(120)  # Wait 2 min before first check
+
+    while True:
+        try:
+            issues = []
+
+            # Check 1: Poller alive? (should poll every 15s, alert if >120s)
+            since_last_poll = time.time() - _last_poll_time
+            if since_last_poll > 120:
+                issues.append(f"⚠️ Poller не працює вже {int(since_last_poll)}с")
+
+            # Check 2: Too many consecutive errors?
+            if _consecutive_errors >= 5:
+                issues.append(f"⚠️ {_consecutive_errors} помилок підряд")
+
+            # Check 3: Balance check
+            balance = get_balance()
+            if balance is not None and balance < 1.0:
+                issues.append(f"⚠️ Низький баланс: ${balance:.2f}")
+
+            # Check 4: Trading still enabled?
+            if not is_trading_enabled():
+                issues.append("⚠️ Трейдинг вимкнений (PRIVATE_KEY)")
+
+            if issues:
+                text = "🏥 <b>Health Alert!</b>\n\n" + "\n".join(issues)
+                await bot.send_message(
+                    chat_id=OWNER_ID, text=text,
+                    parse_mode=ParseMode.HTML,
+                )
+
+        except Exception as e:
+            logger.error(f"Health monitor error: {e}")
+
+        await asyncio.sleep(300)  # Check every 5 min
 
 
 def main():
@@ -772,6 +932,7 @@ def main():
     app.add_handler(CommandHandler("autocopy", autocopy_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("check", check_cmd))
+    app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("portfolio", portfolio_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_amount_handler))
