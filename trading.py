@@ -118,9 +118,8 @@ def get_neg_risk(condition_id: str) -> bool:
 
 def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_id: str = "", post_only: bool = False) -> dict | None:
     """
-    Place a BUY order.
-    post_only=True  → sits in order book, no $1 minimum, no immediate execution
-    post_only=False → GTC, may execute immediately, $1 minimum for marketable orders
+    Place a BUY order (GTC).
+    All orders go as GTC — sits in book if no match, executes if price matches.
     """
     client = _get_client()
     if not client:
@@ -133,17 +132,9 @@ def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_i
         # size = number of shares = amount_usdc / price
         size = round(amount_usdc / price, 2)
 
-        if post_only:
-            # postOnly: no $1 minimum, but minimum 5 shares still applies
-            if size < 5:
-                size = 5.0
-        else:
-            # GTC marketable: minimum $1 and minimum 5 shares
-            if size < 5:
-                size = 5.0
-            actual_cost = size * price
-            if actual_cost < 1.0:
-                size = round(1.0 / price, 2)
+        # Minimum 5 shares (Polymarket requirement)
+        if size < 5:
+            size = 5.0
 
         # Round price to valid tick (0.01)
         price = round(price, 2)
@@ -159,46 +150,14 @@ def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_i
         )
 
         signed = client.create_order(order_args)
-
-        if post_only:
-            # py-clob-client doesn't expose postOnly param natively
-            # Use raw HTTP to pass postOnly=true
+        try:
+            resp = client.post_order(signed, orderType=OrderType.GTC)
+        except TypeError:
             try:
-                import json as _json
-                headers = client.create_l2_headers(client.signer, client.creds)
-                body = {
-                    "order": signed.dict() if hasattr(signed, 'dict') else signed,
-                    "orderType": "GTC",
-                    "postOnly": True,
-                }
-                import httpx
-                r = httpx.post(
-                    f"{client.host}/order",
-                    headers=headers,
-                    json=body,
-                    timeout=10,
-                )
-                resp = r.json()
-                if r.status_code != 200:
-                    logger.error("PostOnly order error: %s", resp)
-                    return None
-            except Exception as e:
-                # Fallback to regular GTC if postOnly fails
-                logger.warning("PostOnly fallback to GTC: %s", e)
-                try:
-                    resp = client.post_order(signed, orderType=OrderType.GTC)
-                except TypeError:
-                    resp = client.post_order(signed)
-            logger.info("BUY postOnly order: price=%s size=%s resp=%s", price, size, resp)
-        else:
-            try:
-                resp = client.post_order(signed, orderType=OrderType.GTC)
+                resp = client.post_order(signed, OrderType.GTC)
             except TypeError:
-                try:
-                    resp = client.post_order(signed, OrderType.GTC)
-                except TypeError:
-                    resp = client.post_order(signed)
-            logger.info("BUY GTC order: price=%s size=%s resp=%s", price, size, resp)
+                resp = client.post_order(signed)
+        logger.info("BUY GTC order: price=%s size=%s resp=%s", price, size, resp)
 
         return {"order_id": resp.get("orderID", ""), "price": price, "size": size, "response": resp}
 
