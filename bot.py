@@ -861,42 +861,25 @@ async def post_init(app: Application):
 
 # ── Health monitor ──────────────────────────────────────────────
 
-_last_poll_time = 0
-_error_count = 0
-_consecutive_errors = 0
-
-def report_poll_success():
-    """Called by poller after each successful cycle."""
-    global _last_poll_time, _consecutive_errors
-    _last_poll_time = time.time()
-    _consecutive_errors = 0
-
-def report_poll_error():
-    """Called by poller on error."""
-    global _error_count, _consecutive_errors
-    _error_count += 1
-    _consecutive_errors += 1
-
-
 async def health_monitor(bot):
     """Background task — checks bot health every 5 min."""
-    global _last_poll_time
-    _last_poll_time = time.time()
+    from health import last_poll_time, consecutive_errors
 
     await asyncio.sleep(120)  # Wait 2 min before first check
 
     while True:
         try:
+            import health
             issues = []
 
             # Check 1: Poller alive? (should poll every 15s, alert if >120s)
-            since_last_poll = time.time() - _last_poll_time
+            since_last_poll = time.time() - health.last_poll_time
             if since_last_poll > 120:
                 issues.append(f"⚠️ Poller не працює вже {int(since_last_poll)}с")
 
             # Check 2: Too many consecutive errors?
-            if _consecutive_errors >= 5:
-                issues.append(f"⚠️ {_consecutive_errors} помилок підряд")
+            if health.consecutive_errors >= 5:
+                issues.append(f"⚠️ {health.consecutive_errors} помилок підряд")
 
             # Check 3: Balance check
             balance = get_balance()
