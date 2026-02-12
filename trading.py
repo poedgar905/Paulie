@@ -161,12 +161,34 @@ def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_i
         signed = client.create_order(order_args)
 
         if post_only:
-            # GTD with postOnly — sits in book
+            # py-clob-client doesn't expose postOnly param natively
+            # Use raw HTTP to pass postOnly=true
             try:
-                resp = client.post_order(signed, orderType=OrderType.GTC)
-                # Check if we can pass post_only flag
-            except TypeError:
-                resp = client.post_order(signed)
+                import json as _json
+                headers = client.create_l2_headers(client.signer, client.creds)
+                body = {
+                    "order": signed.dict() if hasattr(signed, 'dict') else signed,
+                    "orderType": "GTC",
+                    "postOnly": True,
+                }
+                import httpx
+                r = httpx.post(
+                    f"{client.host}/order",
+                    headers=headers,
+                    json=body,
+                    timeout=10,
+                )
+                resp = r.json()
+                if r.status_code != 200:
+                    logger.error("PostOnly order error: %s", resp)
+                    return None
+            except Exception as e:
+                # Fallback to regular GTC if postOnly fails
+                logger.warning("PostOnly fallback to GTC: %s", e)
+                try:
+                    resp = client.post_order(signed, orderType=OrderType.GTC)
+                except TypeError:
+                    resp = client.post_order(signed)
             logger.info("BUY postOnly order: price=%s size=%s resp=%s", price, size, resp)
         else:
             try:
