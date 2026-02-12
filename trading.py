@@ -116,11 +116,11 @@ def get_neg_risk(condition_id: str) -> bool:
     return False
 
 
-def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_id: str = "") -> dict | None:
+def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_id: str = "", post_only: bool = False) -> dict | None:
     """
-    Place a TRUE limit BUY order (GTC + postOnly).
-    postOnly ensures the order sits in the book and never executes immediately.
-    No minimum $1 restriction for postOnly orders.
+    Place a BUY order.
+    post_only=True  → sits in order book, no $1 minimum, no immediate execution
+    post_only=False → GTC, may execute immediately, $1 minimum for marketable orders
     """
     client = _get_client()
     if not client:
@@ -132,9 +132,18 @@ def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_i
 
         # size = number of shares = amount_usdc / price
         size = round(amount_usdc / price, 2)
-        if size < 0.1:
-            logger.error("Size too small: %s", size)
-            return None
+
+        if post_only:
+            # postOnly: no $1 minimum, but minimum 5 shares still applies
+            if size < 5:
+                size = 5.0
+        else:
+            # GTC marketable: minimum $1 and minimum 5 shares
+            if size < 5:
+                size = 5.0
+            actual_cost = size * price
+            if actual_cost < 1.0:
+                size = round(1.0 / price, 2)
 
         # Round price to valid tick (0.01)
         price = round(price, 2)
@@ -150,14 +159,25 @@ def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_i
         )
 
         signed = client.create_order(order_args)
-        try:
-            resp = client.post_order(signed, orderType=OrderType.GTC)
-        except TypeError:
+
+        if post_only:
+            # GTD with postOnly — sits in book
             try:
-                resp = client.post_order(signed, OrderType.GTC)
+                resp = client.post_order(signed, orderType=OrderType.GTC)
+                # Check if we can pass post_only flag
             except TypeError:
                 resp = client.post_order(signed)
-        logger.info("BUY limit order placed: price=%s size=%s resp=%s", price, size, resp)
+            logger.info("BUY postOnly order: price=%s size=%s resp=%s", price, size, resp)
+        else:
+            try:
+                resp = client.post_order(signed, orderType=OrderType.GTC)
+            except TypeError:
+                try:
+                    resp = client.post_order(signed, OrderType.GTC)
+                except TypeError:
+                    resp = client.post_order(signed)
+            logger.info("BUY GTC order: price=%s size=%s resp=%s", price, size, resp)
+
         return {"order_id": resp.get("orderID", ""), "price": price, "size": size, "response": resp}
 
     except Exception as e:
