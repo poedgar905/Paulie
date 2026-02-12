@@ -202,12 +202,6 @@ def calc_autocopy_amount(trader_usdc: float, trader_address: str, price: float =
             return None
         amount = 5.0
 
-    # Ensure minimum 5 shares
-    if price > 0:
-        min_cost = 5.0 * price  # 5 shares minimum
-        if amount < min_cost:
-            amount = min_cost
-
     return amount
 
 
