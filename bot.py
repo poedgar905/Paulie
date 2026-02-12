@@ -500,6 +500,50 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(text, parse_mode=ParseMode.HTML)
 
 
+# ── /cleanup ───────────────────────────────────────────────────
+@owner_only
+async def cleanup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove ghost trades from DB — orders that never filled."""
+    from trading import check_order_status, cancel_order
+
+    copies = get_all_open_copy_trades()
+    if not copies:
+        await update.message.reply_text("✅ Нема відкритих копі-трейдів.")
+        return
+
+    msg = await update.message.reply_text(f"🧹 Перевіряю {len(copies)} позицій...")
+
+    cleaned = 0
+    live_orders = 0
+    real_positions = 0
+
+    for c in copies:
+        order_id = c.get("order_id", "")
+        if order_id:
+            status = check_order_status(order_id)
+            if status == "matched":
+                real_positions += 1
+            elif status == "live":
+                live_orders += 1
+            else:
+                # Order was cancelled, expired, or never filled
+                from database import close_copy_trade
+                close_copy_trade(c["id"], 0, 0, int(time.time()),
+                               pnl_usdc=-float(c.get("usdc_spent", 0)), pnl_pct=-100)
+                cleaned += 1
+        else:
+            # No order_id — can't verify, keep it
+            real_positions += 1
+
+    await msg.edit_text(
+        f"🧹 <b>Cleanup done!</b>\n\n"
+        f"✅ Реальні позиції: {real_positions}\n"
+        f"⏳ Активні лімітки: {live_orders}\n"
+        f"🗑 Видалено привидів: {cleaned}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 # ── Callback handler ────────────────────────────────────────────
 @owner_only
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -838,6 +882,7 @@ async def post_init(app: Application):
         BotCommand("check", "🔍 Останні угоди"),
         BotCommand("balance", "💰 Баланс і P&L"),
         BotCommand("portfolio", "💼 Мої копі-трейди"),
+        BotCommand("cleanup", "🧹 Видалити привидні трейди"),
         BotCommand("autocopy", "🤖 Автокопітрейдинг"),
     ])
 
@@ -925,6 +970,7 @@ def main():
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("check", check_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
+    app.add_handler(CommandHandler("cleanup", cleanup_cmd))
     app.add_handler(CommandHandler("portfolio", portfolio_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_amount_handler))
