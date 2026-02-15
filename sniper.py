@@ -519,6 +519,20 @@ async def _check_session(bot, session: SnipeSession):
                     _auto_sniper.losses += 1
                     _auto_sniper.total_pnl += pnl
 
+                # Log to sheets
+                from datetime import datetime, timezone
+                log_trade_to_sheets(
+                    timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                    market_title=session.title,
+                    market_type=_auto_sniper.market_type if _auto_sniper else "manual",
+                    direction=session.outcome,
+                    entry_price=session.entry_price,
+                    size_usdc=session.total_spent,
+                    shares=session.total_shares,
+                    result="STOP-LOSS",
+                    pnl=pnl,
+                )
+
                 try:
                     await bot.send_message(
                         chat_id=OWNER_ID,
@@ -556,6 +570,20 @@ async def _check_session(bot, session: SnipeSession):
                         _auto_sniper.losses += 1
                     _auto_sniper.total_pnl += pnl
 
+                # Log to sheets
+                from datetime import datetime, timezone
+                log_trade_to_sheets(
+                    timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                    market_title=session.title,
+                    market_type=_auto_sniper.market_type if _auto_sniper else "manual",
+                    direction=session.outcome,
+                    entry_price=session.entry_price,
+                    size_usdc=session.total_spent,
+                    shares=session.total_shares,
+                    result="WIN" if won else "LOSS",
+                    pnl=pnl,
+                )
+
                 emoji = "🟩" if won else "🟥"
                 try:
                     await bot.send_message(
@@ -590,6 +618,96 @@ def _check_win(outcome: str, resolution: str) -> bool:
     if out in ("down", "no") and res in ("down", "no", "0"):
         return True
     return False
+
+
+# ── Google Sheets logging ────────────────────────────────────
+
+def log_trade_to_sheets(
+    timestamp: str,
+    market_title: str,
+    market_type: str,
+    direction: str,      # "Up" or "Down"
+    entry_price: float,
+    size_usdc: float,
+    shares: float,
+    result: str,         # "WIN", "LOSS", "STOP-LOSS"
+    pnl: float,
+    btc_open: float = 0,
+    btc_close: float = 0,
+):
+    """Log a completed sniper trade to Google Sheets '🎯 Sniper' tab."""
+    try:
+        from sheets import _get_client, _get_or_create_sheet
+
+        gc, spreadsheet = _get_client()
+        if not gc or not spreadsheet:
+            return
+
+        ws = _get_or_create_sheet(spreadsheet, "🎯 Sniper")
+
+        # Check if headers exist
+        try:
+            first_cell = ws.acell("A1").value
+        except Exception:
+            first_cell = None
+
+        if not first_cell:
+            # Create headers + formulas
+            headers = [
+                "Timestamp", "Market", "Type", "Direction",
+                "Entry (¢)", "Size ($)", "Shares",
+                "Result", "P&L ($)",
+                "BTC Open", "BTC Close", "BTC Change",
+            ]
+            ws.update("A1:L1", [headers])
+
+            # Summary formulas in column N
+            summary = [
+                ["STATS", ""],
+                ["Total trades", '=COUNTA(A2:A)'],
+                ["Wins", '=COUNTIF(H2:H,"WIN")'],
+                ["Losses", '=COUNTIF(H2:H,"LOSS")'],
+                ["Stop-losses", '=COUNTIF(H2:H,"STOP-LOSS")'],
+                ["Win Rate %", '=IF(N3>0,N4/(N4+N5+N6)*100,0)'],
+                ["Total P&L $", '=SUM(I2:I)'],
+                ["Total Spent $", '=SUM(F2:F)'],
+                ["ROI %", '=IF(N9>0,N8/N9*100,0)'],
+                ["Avg Win $", '=IF(N4>0,SUMIF(H2:H,"WIN",I2:I)/N4,0)'],
+                ["Avg Loss $", '=IF((N5+N6)>0,(SUMIF(H2:H,"LOSS",I2:I)+SUMIF(H2:H,"STOP-LOSS",I2:I))/(N5+N6),0)'],
+                ["Best Trade $", '=MAX(I2:I)'],
+                ["Worst Trade $", '=MIN(I2:I)'],
+            ]
+            ws.update("N1:O13", summary)
+
+            # Format header row bold
+            try:
+                ws.format("A1:L1", {"textFormat": {"bold": True}})
+                ws.format("N1:O1", {"textFormat": {"bold": True}})
+            except Exception:
+                pass
+
+        # Append trade row
+        btc_change = round(btc_close - btc_open, 2) if btc_open and btc_close else 0
+        row = [
+            timestamp,
+            market_title[:60],
+            market_type,
+            direction,
+            round(entry_price * 100, 1),
+            round(size_usdc, 2),
+            round(shares, 2),
+            result,
+            round(pnl, 4),
+            round(btc_open, 2) if btc_open else "",
+            round(btc_close, 2) if btc_close else "",
+            btc_change if btc_change else "",
+        ]
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        logger.info("Logged sniper trade to sheets: %s %s %.0f¢ %s $%.2f",
+                     direction, result, entry_price * 100, market_type, pnl)
+
+    except Exception as e:
+        logger.error("Sheets logging error: %s", e)
 
 
 # ── Format ───────────────────────────────────────────────────
