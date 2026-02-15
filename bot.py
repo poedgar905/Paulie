@@ -85,7 +85,12 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/balance — Баланс і P&L\n"
         f"/portfolio — Your open copy-trades\n"
         f"/autocopy <code>name ON/OFF</code> — Auto copy-trading\n\n"
-        f"🔄 Polls every 15 sec\n"
+        f"🎯 <b>Sniper:</b>\n"
+        f"/snipe <code>event_url</code> — Ручний снайпер\n"
+        f"/snipe_auto — 🤖 Авто-снайпер (Binance тригер)\n"
+        f"/snipe_status — Статус\n"
+        f"/snipe_stop — Зупинити всіх\n\n"
+        f"🔄 Polls every 3 sec\n"
         f"📊 Google Sheets updates every 5 min\n"
         f"🟢 BUY → with [Copy Trade] button\n"
         f"🔴 SELL → reply to BUY + P&L\n"
@@ -913,6 +918,10 @@ async def post_init(app: Application):
         BotCommand("portfolio", "💼 Мої копі-трейди"),
         BotCommand("cleanup", "🧹 Видалити привидні трейди"),
         BotCommand("autocopy", "🤖 Автокопітрейдинг"),
+        BotCommand("snipe", "🎯 Ручний снайпер"),
+        BotCommand("snipe_auto", "🤖 Авто-снайпер"),
+        BotCommand("snipe_status", "📊 Статус снайперів"),
+        BotCommand("snipe_stop", "🛑 Зупинити снайперів"),
     ])
 
     # Start poller
@@ -935,6 +944,11 @@ async def post_init(app: Application):
     # Start health monitor
     asyncio.create_task(health_monitor(app.bot))
     logger.info("Health monitor started")
+
+    # Start sniper checker
+    from sniper import sniper_checker
+    asyncio.create_task(sniper_checker(app.bot))
+    logger.info("Sniper checker started")
 
     trading = "✅" if is_trading_enabled() else "❌ (no key)"
     try:
@@ -991,6 +1005,447 @@ async def health_monitor(bot):
         await asyncio.sleep(300)  # Check every 5 min
 
 
+# ── /snipe — Directional sniper ───────────────────────────────
+
+_snipe_setup: dict = {}  # user_id -> setup state
+
+@owner_only
+async def snipe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start sniper: /snipe <event_url>"""
+    if not context.args:
+        await update.message.reply_text(
+            "🎯 <b>Sniper</b>\n\n"
+            "Usage: /snipe <code>polymarket_event_url</code>\n"
+            "Example: /snipe https://polymarket.com/event/btc-updown-15m-...\n\n"
+            "Ставить лімітку на YES або NO по твоїй ціні.\n"
+            "Коли ринок закривається — YES=$1 або $0.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    url = context.args[0]
+    match = re.search(r'polymarket\.com/event/([^\s/?#]+)', url)
+    if not match:
+        await update.message.reply_text("❌ Невірна силка. Потрібен формат: https://polymarket.com/event/...")
+        return
+
+    slug = match.group(1)
+    msg = await update.message.reply_text("⏳ Завантажую...")
+
+    try:
+        from sniper import fetch_event_by_slug, fetch_orderbook, get_token_id
+        import requests
+
+        event = fetch_event_by_slug(slug)
+        if not event:
+            await msg.edit_text("❌ Не знайшов івент.")
+            return
+
+        markets = event.get("markets", [])
+        if not markets:
+            await msg.edit_text("❌ Івент не має ринків.")
+            return
+
+        market = markets[0]
+        cid = market.get("conditionId", "")
+        title = market.get("question", event.get("title", "?"))
+
+        # Get orderbook for YES
+        token_yes = get_token_id(cid, "yes")
+        book = fetch_orderbook(token_yes) if token_yes else None
+
+        book_text = ""
+        if book:
+            book_text = (
+                f"\n📖 <b>Orderbook (YES):</b>\n"
+                f"   Best Bid: {book['best_bid']*100:.0f}¢ | Best Ask: {book['best_ask']*100:.0f}¢\n"
+                f"   Mid: {book['mid']*100:.0f}¢ | Spread: {book['spread']*100:.0f}¢"
+            )
+
+        uid = update.effective_user.id
+        _snipe_setup[uid] = {
+            "event": event,
+            "market": market,
+            "slug": slug,
+            "cid": cid,
+            "token_yes": token_yes,
+            "book": book,
+            "step": "pick_side",
+        }
+
+        # Detect market type from slug
+        mtype = "15m"
+        if "-5m-" in slug: mtype = "5m"
+        elif "-1h-" in slug or "1-hour" in slug: mtype = "1h"
+        elif "-4h-" in slug: mtype = "4h"
+        elif "-daily-" in slug or "on-february" in slug: mtype = "daily"
+        _snipe_setup[uid]["market_type"] = mtype
+
+        buttons = [
+            [InlineKeyboardButton("🟢 YES / UP", callback_data="snipe_side:YES"),
+             InlineKeyboardButton("🔴 NO / DOWN", callback_data="snipe_side:NO")],
+        ]
+        await msg.edit_text(
+            f"🎯 <b>{title[:80]}</b>\n"
+            f"⏱ Type: {mtype}"
+            f"{book_text}\n\n"
+            f"Що купляємо?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    except Exception as e:
+        await msg.edit_text(f"❌ Помилка: {e}")
+
+
+@owner_only
+async def snipe_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show all active snipers + auto-sniper."""
+    from sniper import get_all_sessions, format_session_status, format_auto_status, get_auto_sniper
+
+    auto = get_auto_sniper()
+    if auto:
+        await update.message.reply_text(format_auto_status(), parse_mode=ParseMode.HTML)
+
+    sessions = get_all_sessions()
+    if not sessions and not auto:
+        await update.message.reply_text("🎯 Немає активних снайперів.")
+
+
+@owner_only
+async def snipe_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop all snipers."""
+    from sniper import stop_all, format_auto_status
+
+    stopped_sessions, auto = stop_all()
+
+    if not stopped_sessions and not auto:
+        await update.message.reply_text("🎯 Немає активних снайперів.")
+        return
+
+    text = "🛑 <b>All snipers stopped</b>\n\n"
+    if auto:
+        total = auto.wins + auto.losses
+        wr = (auto.wins / total * 100) if total > 0 else 0
+        sign = "+" if auto.total_pnl >= 0 else ""
+        text += (
+            f"📈 Trades: {auto.total_trades}\n"
+            f"🏆 {auto.wins}W / {auto.losses}L ({wr:.0f}%)\n"
+            f"💰 P&L: {sign}${auto.total_pnl:.2f}"
+        )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+@owner_only
+async def snipe_auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start auto-sniper: /snipe_auto"""
+    from sniper import get_auto_sniper
+
+    if get_auto_sniper():
+        await update.message.reply_text("🤖 Auto-sniper вже запущений. /snipe_stop щоб зупинити.")
+        return
+
+    uid = update.effective_user.id
+    _snipe_setup[uid] = {"mode": "auto", "step": "pick_type"}
+
+    buttons = [
+        [InlineKeyboardButton("⚡ 15 min", callback_data="snipe_type:15m"),
+         InlineKeyboardButton("⏱ 1 hour", callback_data="snipe_type:1h")],
+    ]
+    await update.message.reply_text(
+        "🤖 <b>Auto-Sniper Setup</b>\n\n"
+        "Бот автоматично:\n"
+        "1. Чекає до останніх хвилин ринку\n"
+        "2. Дивиться BTC на Binance\n"
+        "3. Якщо BTC чітко йде вгору/вниз → ставить лімітку\n"
+        "4. Стоп-лос якщо ціна розвернулась\n"
+        "5. Переходить на наступний ринок\n\n"
+        "Вибери тип ринку:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def snipe_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle sniper setup inline buttons."""
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+
+    if uid != OWNER_ID:
+        return
+
+    data = query.data
+    setup = _snipe_setup.get(uid)
+    if not setup:
+        await query.edit_message_text("❌ Сесія закінчилась. Почни знову: /snipe")
+        return
+
+    # ── Auto: pick market type ─────────────────────────────
+    if data.startswith("snipe_type:"):
+        mtype = data.split(":")[1]
+        setup["market_type"] = mtype
+        setup["step"] = "auto_price"
+
+        buttons = [
+            [InlineKeyboardButton("80¢", callback_data="snipe_aprice:80"),
+             InlineKeyboardButton("83¢", callback_data="snipe_aprice:83")],
+            [InlineKeyboardButton("85¢", callback_data="snipe_aprice:85"),
+             InlineKeyboardButton("88¢", callback_data="snipe_aprice:88")],
+        ]
+        enter_sec = 180 if mtype == "15m" else 300
+        await query.edit_message_text(
+            f"⏱ {mtype} | Входимо за {enter_sec}с до кінця\n\n"
+            f"Ціна входу (лімітка):",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif data.startswith("snipe_aprice:"):
+        price = int(data.split(":")[1])
+        setup["price"] = price / 100
+        setup["step"] = "auto_size"
+
+        buttons = [
+            [InlineKeyboardButton("$0.50", callback_data="snipe_asize:0.5"),
+             InlineKeyboardButton("$1", callback_data="snipe_asize:1")],
+            [InlineKeyboardButton("$2", callback_data="snipe_asize:2"),
+             InlineKeyboardButton("$5", callback_data="snipe_asize:5")],
+        ]
+        await query.edit_message_text(
+            f"⏱ {setup['market_type']} | Entry: {price}¢\n\nРозмір:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif data.startswith("snipe_asize:"):
+        size = float(data.split(":")[1])
+        setup["size"] = size
+        setup["step"] = "auto_stoploss"
+
+        buttons = [
+            [InlineKeyboardButton("5¢", callback_data="snipe_asl:5"),
+             InlineKeyboardButton("10¢", callback_data="snipe_asl:10")],
+            [InlineKeyboardButton("15¢", callback_data="snipe_asl:15"),
+             InlineKeyboardButton("❌ Без SL", callback_data="snipe_asl:0")],
+        ]
+        await query.edit_message_text(
+            f"⏱ {setup['market_type']} | {int(setup['price']*100)}¢ | ${size:.2f}\n\nСтоп-лос:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif data.startswith("snipe_asl:"):
+        sl = int(data.split(":")[1])
+        setup["stop_loss"] = sl
+
+        mtype = setup["market_type"]
+        price = setup["price"]
+        size = setup["size"]
+        enter_sec = 180 if mtype == "15m" else 300
+        shares = round(size / price, 2)
+        profit = round(shares * (1 - price), 2)
+
+        buttons = [
+            [InlineKeyboardButton("🤖 ЗАПУСТИТИ", callback_data="snipe_ago:yes"),
+             InlineKeyboardButton("❌ Скасувати", callback_data="snipe_ago:no")],
+        ]
+        await query.edit_message_text(
+            f"🤖 <b>Auto-Sniper — Confirm</b>\n\n"
+            f"⏱ Ринок: BTC Up/Down {mtype}\n"
+            f"🎯 Entry: {int(price*100)}¢ | ${size:.2f} = {shares:.1f} shares\n"
+            f"⏰ Входити за {enter_sec}с до кінця\n"
+            f"📊 Тригер: BTC рух ≥0.03% на Binance\n"
+            f"🛡 Stop-loss: {sl}¢{'(вимкнено)' if sl == 0 else ''}\n"
+            f"✅ Win: +${profit:.2f} | ❌ Loss: -${size:.2f}\n\n"
+            f"Автоматично входить в кожний ринок 24/7.\n"
+            f"Запускаємо?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif data.startswith("snipe_ago:"):
+        choice = data.split(":")[1]
+        if choice == "no":
+            _snipe_setup.pop(uid, None)
+            await query.edit_message_text("❌ Скасовано.")
+            return
+
+        from sniper import start_auto_sniper, format_auto_status
+
+        mtype = setup["market_type"]
+        price = setup["price"]
+        size = setup["size"]
+        sl = setup["stop_loss"]
+        enter_sec = 180 if mtype == "15m" else 300
+
+        auto = start_auto_sniper(
+            market_type=mtype,
+            entry_price=price,
+            size_usdc=size,
+            stop_loss_cents=sl,
+            enter_before_sec=enter_sec,
+            min_btc_move_pct=0.03,
+        )
+
+        _snipe_setup.pop(uid, None)
+
+        await query.edit_message_text(
+            f"🤖 <b>Auto-Sniper запущено!</b>\n\n"
+            + format_auto_status(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    # ── Manual snipe: pick side ───────────────────────────
+    elif data.startswith("snipe_side:"):
+        side = data.split(":")[1]  # "YES" or "NO"
+        setup["side"] = side
+        setup["step"] = "pick_price"
+
+        buttons = [
+            [InlineKeyboardButton("80¢", callback_data="snipe_price:80"),
+             InlineKeyboardButton("85¢", callback_data="snipe_price:85")],
+            [InlineKeyboardButton("88¢", callback_data="snipe_price:88"),
+             InlineKeyboardButton("90¢", callback_data="snipe_price:90")],
+            [InlineKeyboardButton("92¢", callback_data="snipe_price:92"),
+             InlineKeyboardButton("95¢", callback_data="snipe_price:95")],
+        ]
+        await query.edit_message_text(
+            f"{'🟢' if side == 'YES' else '🔴'} {side}\n\n"
+            f"Ціна входу (лімітка):\n"
+            f"Чим вища — тим частіше fill, але менше профіту.\n"
+            f"80¢ = рідко fill, +20¢ profit\n"
+            f"92¢ = часто fill, +8¢ profit",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    # ── Pick price ────────────────────────────────────────
+    elif data.startswith("snipe_price:"):
+        price_cents = int(data.split(":")[1])
+        setup["price"] = price_cents / 100
+        setup["step"] = "pick_size"
+
+        buttons = [
+            [InlineKeyboardButton("$0.50", callback_data="snipe_size:0.5"),
+             InlineKeyboardButton("$1", callback_data="snipe_size:1")],
+            [InlineKeyboardButton("$2", callback_data="snipe_size:2"),
+             InlineKeyboardButton("$5", callback_data="snipe_size:5")],
+        ]
+        await query.edit_message_text(
+            f"{'🟢' if setup['side'] == 'YES' else '🔴'} {setup['side']} @ {price_cents}¢\n\n"
+            f"Розмір ордера:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    # ── Pick size ─────────────────────────────────────────
+    elif data.startswith("snipe_size:"):
+        size = float(data.split(":")[1])
+        setup["size"] = size
+        setup["step"] = "pick_roll"
+
+        buttons = [
+            [InlineKeyboardButton("🔄 Auto-roll ON", callback_data="snipe_roll:yes"),
+             InlineKeyboardButton("1️⃣ Один раз", callback_data="snipe_roll:no")],
+        ]
+        await query.edit_message_text(
+            f"{'🟢' if setup['side'] == 'YES' else '🔴'} {setup['side']} @ {int(setup['price']*100)}¢ | ${size:.2f}\n\n"
+            f"Авто-ролл? (автоматично переходити на наступний ринок після резолюції)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    # ── Pick auto-roll → confirm ──────────────────────────
+    elif data.startswith("snipe_roll:"):
+        auto_roll = data.split(":")[1] == "yes"
+        setup["auto_roll"] = auto_roll
+
+        side = setup["side"]
+        price = setup["price"]
+        size = setup["size"]
+        mtype = setup.get("market_type", "15m")
+        title = setup["market"].get("question", "?")
+        shares = round(size / price, 2)
+        profit_if_win = round(shares * (1 - price), 2)
+        loss_if_lose = round(size, 2)
+
+        book = setup.get("book")
+        book_text = ""
+        if book:
+            book_text = f"\n📖 Mid: {book['mid']*100:.0f}¢ | Spread: {book['spread']*100:.0f}¢"
+
+        buttons = [
+            [InlineKeyboardButton("🎯 START SNIPER", callback_data="snipe_go:yes"),
+             InlineKeyboardButton("❌ Cancel", callback_data="snipe_go:no")],
+        ]
+        await query.edit_message_text(
+            f"🎯 <b>Sniper — Confirm</b>\n\n"
+            f"📌 {title[:70]}\n"
+            f"{'🟢' if side == 'YES' else '🔴'} {side} @ {int(price*100)}¢\n"
+            f"💵 ${size:.2f} = {shares:.1f} shares\n"
+            f"✅ Win: +${profit_if_win:.2f} ({int((1-price)*100)}¢/share)\n"
+            f"❌ Loss: -${loss_if_lose:.2f}\n"
+            f"🔄 Auto-roll: {'ON' if auto_roll else 'OFF'} ({mtype})"
+            f"{book_text}\n\n"
+            f"Запускаємо?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    # ── Confirm → GO! ─────────────────────────────────────
+    elif data.startswith("snipe_go:"):
+        choice = data.split(":")[1]
+        if choice == "no":
+            _snipe_setup.pop(uid, None)
+            await query.edit_message_text("❌ Скасовано.")
+            return
+
+        from sniper import start_session, format_session_status, get_token_id
+
+        side = setup["side"]
+        price = setup["price"]
+        size = setup["size"]
+        cid = setup["cid"]
+        slug = setup["slug"]
+        market = setup["market"]
+        event = setup["event"]
+        auto_roll = setup.get("auto_roll", False)
+        mtype = setup.get("market_type", "15m")
+
+        # Get correct token ID
+        outcome_for_api = "yes" if side == "YES" else "no"
+        token_id = get_token_id(cid, outcome_for_api)
+
+        if not token_id:
+            await query.edit_message_text("❌ Не вдалось знайти token_id.")
+            _snipe_setup.pop(uid, None)
+            return
+
+        session = start_session(
+            condition_id=cid,
+            token_id=token_id,
+            outcome=side,
+            title=market.get("question", "?"),
+            event_slug=slug,
+            entry_price=price,
+            size_usdc=size,
+            side=side,
+            auto_roll=auto_roll,
+            market_type=mtype,
+        )
+
+        _snipe_setup.pop(uid, None)
+
+        if session:
+            await query.edit_message_text(
+                format_session_status(session),
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await query.edit_message_text("❌ Не вдалось розмістити ордер. Перевір баланс.")
+
+
 def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
@@ -1007,6 +1462,11 @@ def main():
     app.add_handler(CommandHandler("cleanup", cleanup_cmd))
     app.add_handler(CommandHandler("reset_pnl", reset_pnl_cmd))
     app.add_handler(CommandHandler("portfolio", portfolio_cmd))
+    app.add_handler(CommandHandler("snipe", snipe_cmd))
+    app.add_handler(CommandHandler("snipe_auto", snipe_auto_cmd))
+    app.add_handler(CommandHandler("snipe_status", snipe_status_cmd))
+    app.add_handler(CommandHandler("snipe_stop", snipe_stop_cmd))
+    app.add_handler(CallbackQueryHandler(snipe_callback_handler, pattern=r"^snipe_"))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_amount_handler))
 
