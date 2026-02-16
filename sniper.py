@@ -60,6 +60,7 @@ class SnipeSession:
     last_check: int = 0
     error_count: int = 0
     market_end_ts: int = 0
+    mid_at_fill: float = 0  # Mid price when order was filled
 
 
 @dataclass
@@ -612,13 +613,19 @@ async def _check_session(bot, session: SnipeSession):
             session.total_spent += session.size_usdc
             session.total_shares += shares
 
+            # Record mid price at fill for proper stop-loss baseline
+            fill_mid = fetch_midprice(session.token_id)
+            session.mid_at_fill = fill_mid if fill_mid else 0
+
             try:
                 await bot.send_message(
                     chat_id=OWNER_ID,
                     text=(
                         f"✅ <b>FILL!</b> {session.outcome} @ {session.entry_price*100:.0f}¢\n"
                         f"📌 {session.title[:50]}\n"
-                        f"📊 {shares:.1f} shares = ${session.size_usdc:.2f}"
+                        f"📊 {shares:.1f} shares = ${session.size_usdc:.2f}\n"
+                        f"📈 Mid at fill: {session.mid_at_fill*100:.0f}¢\n"
+                        f"⏳ Чекаємо resolution..."
                     ),
                     parse_mode="HTML",
                 )
@@ -631,54 +638,57 @@ async def _check_session(bot, session: SnipeSession):
             return
 
     # ── Stop-loss ─────────────────────────────────────────
+    # For late-entry: mid is often BELOW entry price at fill time.
+    # SL triggers if mid drops X¢ below MID AT FILL, not below entry price.
     if session.order_status == "matched" and session.stop_loss_cents > 0:
-        mid = fetch_midprice(session.token_id)
-        if mid and mid > 0:
-            drop = session.entry_price - mid
-            if drop >= session.stop_loss_cents / 100:
-                place_market_sell(session.token_id, session.total_shares, session.condition_id)
-                pnl = (mid * session.total_shares) - session.total_spent
+        if session.mid_at_fill and session.mid_at_fill > 0:
+            mid = fetch_midprice(session.token_id)
+            if mid and mid > 0:
+                drop = session.mid_at_fill - mid
+                if drop >= session.stop_loss_cents / 100:
+                    # STOP-LOSS triggered
+                    place_market_sell(session.token_id, session.total_shares, session.condition_id)
+                    pnl = (mid * session.total_shares) - session.total_spent
 
-                if _auto_sniper:
-                    _auto_sniper.losses += 1
-                    _auto_sniper.total_pnl += pnl
+                    if _auto_sniper:
+                        _auto_sniper.losses += 1
+                        _auto_sniper.total_pnl += pnl
 
-                # Log to sheets
-                from datetime import datetime, timezone
-                log_trade_to_sheets(
-                    timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                    market_title=session.title,
-                    market_type=_auto_sniper.market_type if _auto_sniper else "manual",
-                    direction=session.outcome,
-                    entry_price=session.entry_price,
-                    size_usdc=session.total_spent,
-                    shares=session.total_shares,
-                    result="STOP-LOSS",
-                    pnl=pnl,
-                    enter_before_sec=_auto_sniper.enter_before_sec if _auto_sniper else 0,
-                    btc_trigger_pct=_auto_sniper.min_btc_move_pct if _auto_sniper else 0,
-                    stop_loss_cents=session.stop_loss_cents,
-                    time_left_at_entry=max(0, session.market_end_ts - session.started_at),
-                )
-
-                try:
-                    await bot.send_message(
-                        chat_id=OWNER_ID,
-                        text=(
-                            f"🛑 <b>STOP-LOSS!</b>\n"
-                            f"📌 {session.title[:50]}\n"
-                            f"Entry: {session.entry_price*100:.0f}¢ → {mid*100:.0f}¢\n"
-                            f"💰 ${pnl:.2f}"
-                            + (f"\n📈 {_auto_sniper.wins}W/{_auto_sniper.losses}L = ${_auto_sniper.total_pnl:.2f}" if _auto_sniper else "")
-                        ),
-                        parse_mode="HTML",
+                    from datetime import datetime, timezone
+                    log_trade_to_sheets(
+                        timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                        market_title=session.title,
+                        market_type=_auto_sniper.market_type if _auto_sniper else "manual",
+                        direction=session.outcome,
+                        entry_price=session.entry_price,
+                        size_usdc=session.total_spent,
+                        shares=session.total_shares,
+                        result="STOP-LOSS",
+                        pnl=pnl,
+                        enter_before_sec=_auto_sniper.enter_before_sec if _auto_sniper else 0,
+                        btc_trigger_pct=_auto_sniper.min_btc_move_pct if _auto_sniper else 0,
+                        stop_loss_cents=session.stop_loss_cents,
+                        time_left_at_entry=max(0, session.market_end_ts - session.started_at),
                     )
-                except Exception:
-                    pass
 
-                session.active = False
-                remove_session(session.condition_id)
-                return
+                    try:
+                        await bot.send_message(
+                            chat_id=OWNER_ID,
+                            text=(
+                                f"🛑 <b>STOP-LOSS!</b>\n"
+                                f"📌 {session.title[:50]}\n"
+                                f"Mid at fill: {session.mid_at_fill*100:.0f}¢ → Now: {mid*100:.0f}¢ (drop {drop*100:.0f}¢)\n"
+                                f"💰 ${pnl:.2f}"
+                                + (f"\n📈 {_auto_sniper.wins}W/{_auto_sniper.losses}L = ${_auto_sniper.total_pnl:.2f}" if _auto_sniper else "")
+                            ),
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+
+                    session.active = False
+                    remove_session(session.condition_id)
+                    return
 
     # ── Resolution ────────────────────────────────────────
     if session.order_status == "matched" and session.market_end_ts > 0:
