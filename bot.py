@@ -1238,13 +1238,70 @@ async def snipe_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     elif data.startswith("snipe_asl:"):
         sl = int(data.split(":")[1])
         setup["stop_loss"] = sl
+        setup["step"] = "auto_timing"
 
+        mtype = setup["market_type"]
+        buttons = [
+            [InlineKeyboardButton("30с", callback_data="snipe_atime:30"),
+             InlineKeyboardButton("60с", callback_data="snipe_atime:60")],
+            [InlineKeyboardButton("120с", callback_data="snipe_atime:120"),
+             InlineKeyboardButton("180с", callback_data="snipe_atime:180")],
+        ]
+        if mtype == "1h":
+            buttons = [
+                [InlineKeyboardButton("60с", callback_data="snipe_atime:60"),
+                 InlineKeyboardButton("120с", callback_data="snipe_atime:120")],
+                [InlineKeyboardButton("180с", callback_data="snipe_atime:180"),
+                 InlineKeyboardButton("300с", callback_data="snipe_atime:300")],
+            ]
+
+        await query.edit_message_text(
+            f"⏱ {mtype} | {int(setup['price']*100)}¢ | SL: {sl}¢\n\n"
+            f"За скільки до кінця входити?\n\n"
+            f"30с = рідко fill, але точний\n"
+            f"60с = баланс точності і fill\n"
+            f"120с = частіше fill\n"
+            f"180с = найчастіше fill, але ризик розвороту",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif data.startswith("snipe_atime:"):
+        enter_sec = int(data.split(":")[1])
+        setup["enter_sec"] = enter_sec
+        setup["step"] = "auto_btc_trigger"
+
+        buttons = [
+            [InlineKeyboardButton("0.01%", callback_data="snipe_abtc:0.01"),
+             InlineKeyboardButton("0.03%", callback_data="snipe_abtc:0.03")],
+            [InlineKeyboardButton("0.05%", callback_data="snipe_abtc:0.05"),
+             InlineKeyboardButton("0.10%", callback_data="snipe_abtc:0.10")],
+        ]
+        await query.edit_message_text(
+            f"⏱ {setup['market_type']} | {int(setup['price']*100)}¢ | SL: {setup['stop_loss']}¢ | {enter_sec}с\n\n"
+            f"Мін. рух BTC щоб увійти:\n\n"
+            f"0.01% = входить майже завжди (~$10 рух)\n"
+            f"0.03% = помірний фільтр (~$30 рух)\n"
+            f"0.05% = строгий (~$50 рух)\n"
+            f"0.10% = тільки сильний рух (~$100)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif data.startswith("snipe_abtc:"):
+        btc_trigger = float(data.split(":")[1])
+        setup["btc_trigger"] = btc_trigger
+
+        # ── CONFIRM ───────────────────────────────────────
         mtype = setup["market_type"]
         price = setup["price"]
         size = setup["size"]
-        enter_sec = 180 if mtype == "15m" else 300
+        sl = setup["stop_loss"]
+        enter_sec = setup["enter_sec"]
         shares = round(size / price, 2)
         profit = round(shares * (1 - price), 2)
+        loss_with_sl = round(shares * (sl / 100), 2) if sl > 0 else round(size, 2)
+        loss_label = f"-${loss_with_sl:.2f} (SL {sl}¢)" if sl > 0 else f"-${size:.2f} (без SL)"
 
         buttons = [
             [InlineKeyboardButton("🤖 ЗАПУСТИТИ", callback_data="snipe_ago:yes"),
@@ -1255,9 +1312,10 @@ async def snipe_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             f"⏱ Ринок: BTC Up/Down {mtype}\n"
             f"🎯 Entry: {int(price*100)}¢ | ${size:.2f} = {shares:.1f} shares\n"
             f"⏰ Входити за {enter_sec}с до кінця\n"
-            f"📊 Тригер: BTC рух ≥0.03% на Binance\n"
-            f"🛡 Stop-loss: {sl}¢{'(вимкнено)' if sl == 0 else ''}\n"
-            f"✅ Win: +${profit:.2f} | ❌ Loss: -${size:.2f}\n\n"
+            f"📊 Тригер: BTC рух ≥{btc_trigger:.2f}% на Binance\n"
+            f"🛡 Stop-loss: {sl}¢{' (вимкнено)' if sl == 0 else ''}\n"
+            f"✅ Win: +${profit:.2f} | ❌ Loss: {loss_label}\n"
+            f"🔒 Momentum: входить тільки коли ціна росте\n\n"
             f"Автоматично входить в кожний ринок 24/7.\n"
             f"Запускаємо?",
             parse_mode=ParseMode.HTML,
@@ -1277,7 +1335,8 @@ async def snipe_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         price = setup["price"]
         size = setup["size"]
         sl = setup["stop_loss"]
-        enter_sec = 180 if mtype == "15m" else 300
+        enter_sec = setup.get("enter_sec", 180)
+        btc_trigger = setup.get("btc_trigger", 0.03)
 
         auto = start_auto_sniper(
             market_type=mtype,
@@ -1285,7 +1344,7 @@ async def snipe_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             size_usdc=size,
             stop_loss_cents=sl,
             enter_before_sec=enter_sec,
-            min_btc_move_pct=0.03,
+            min_btc_move_pct=btc_trigger,
         )
 
         _snipe_setup.pop(uid, None)
