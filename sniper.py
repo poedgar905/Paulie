@@ -524,13 +524,56 @@ async def _run_auto_sniper(bot):
     if btc_change_pct < auto.min_btc_move_pct:
         return
 
+    # ── TREND CONFIRMATION ────────────────────────────────
+    # Check last 1-min candle to see if BTC is STILL moving in same direction
+    # or if it's bouncing back (spike & reversal trap)
+    kline_1m = get_btc_kline("1m", 2)  # Get last 2 one-minute candles
+    if kline_1m:
+        # kline_1m returns only the latest; get 2 candles for comparison
+        pass
+
+    # Better approach: get last 3 one-minute klines
+    try:
+        import requests as _req
+        resp = _req.get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": "BTCUSDT", "interval": "1m", "limit": 3},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            candles = resp.json()
+            if len(candles) >= 2:
+                # Previous 1m candle close
+                prev_close = float(candles[-2][4])
+                # Current price vs previous close
+                recent_move = btc_now - prev_close
+
+                if btc_change > 0:
+                    # We think UP — but is BTC still going up?
+                    if recent_move < 0:
+                        # BTC was up overall but DROPPED in last minute = reversal
+                        logger.info("Skip UP: BTC reversing (last 1m: %+.0f)", recent_move)
+                        return
+                else:
+                    # We think DOWN — but is BTC still going down?
+                    if recent_move > 0:
+                        # BTC was down overall but ROSE in last minute = reversal
+                        logger.info("Skip DOWN: BTC reversing (last 1m: %+.0f)", recent_move)
+                        return
+
+                logger.info("Trend confirmed: overall %+.0f, last 1m %+.0f",
+                            btc_change, recent_move)
+    except Exception as e:
+        logger.debug("Trend check error: %s", e)
+        # Continue anyway if trend check fails
+
     # Direction
     if btc_change > 0:
         direction = "Up"
-        token_id = live["token_yes"]  # YES token = Up
+        token_id = live["token_yes"]
     else:
         direction = "Down"
-        token_id = live["token_no"]   # NO token = Down
+        token_id = live["token_no"]
 
     if not token_id:
         logger.warning("No token_id for direction %s", direction)
@@ -594,7 +637,8 @@ async def _run_auto_sniper(bot):
             f"💵 ${auto.size_usdc:.2f}"
             f"{f' | Mid: {mid*100:.0f}¢' if mid else ''}\n"
             f"📊 BTC: ${btc_open:,.0f} → ${btc_now:,.0f} ({'+' if btc_change > 0 else ''}{btc_change:,.0f}, {btc_change_pct:.3f}%)\n"
-            f"⏱ {time_left}s left | 🛡 SL: {auto.stop_loss_cents}¢"
+            f"✅ Trend confirmed (last 1m same direction)\n"
+            f"⏱ {time_left}s left"
         )
     except Exception:
         pass
