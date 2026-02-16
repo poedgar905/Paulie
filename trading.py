@@ -131,11 +131,12 @@ def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_i
         from py_clob_client.order_builder.constants import BUY
 
         # size = number of shares = amount_usdc / price
-        # Ensure actual order value always >= $1 (Polymarket minimum)
+        # CLOB rounds internally and can end up below $1 minimum
+        # Add 5% buffer to guarantee we pass the minimum
         import math
-        size = math.ceil(amount_usdc / price * 100) / 100  # Round UP to 2 decimals
-        if size * price < 1.0:
-            size = math.ceil(1.0 / price * 100) / 100 + 0.01
+        size = math.ceil(amount_usdc * 1.05 / price * 100) / 100
+        if size * price < 1.05:
+            size = math.ceil(1.05 / price * 100) / 100
 
         # Round price to valid tick (0.01)
         price = round(price, 2)
