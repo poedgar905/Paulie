@@ -235,6 +235,114 @@ def find_current_market_slug(market_type: str = "15m") -> str | None:
     return f"{prefix}{period_start}"
 
 
+def find_live_market(market_type: str = "15m") -> dict | None:
+    """Find currently active BTC up/down market via Gamma API.
+
+    Tries current, previous, and next time windows since timestamps
+    may not align exactly with our clock.
+    Returns dict with: slug, conditionId, token_ids, end_ts, question
+    """
+    import requests
+
+    now = int(time.time())
+    intervals = {"5m": (300, "btc-updown-5m-"), "15m": (900, "btc-updown-15m-"),
+                 "1h": (3600, "btc-updown-1h-"), "4h": (14400, "btc-updown-4h-")}
+    if market_type not in intervals:
+        return None
+
+    interval, prefix = intervals[market_type]
+    period_start = (now // interval) * interval
+
+    # Try current, previous, next windows
+    offsets = [0, -interval, interval, -interval * 2]
+    for offset in offsets:
+        ts = period_start + offset
+        slug = f"{prefix}{ts}"
+        try:
+            resp = requests.get(
+                "https://gamma-api.polymarket.com/events",
+                params={"slug": slug, "closed": "false"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                events = resp.json()
+                if isinstance(events, list) and events:
+                    event = events[0]
+                    markets = event.get("markets", [])
+                    if markets:
+                        market = markets[0]
+                        cid = market.get("conditionId", "")
+                        question = market.get("question", event.get("title", "?"))
+                        end_ts = ts + interval
+
+                        # Parse token IDs
+                        import json
+                        tokens_raw = market.get("clobTokenIds", "")
+                        if isinstance(tokens_raw, str):
+                            try:
+                                tokens = json.loads(tokens_raw)
+                            except (json.JSONDecodeError, TypeError):
+                                tokens = [t.strip() for t in tokens_raw.split(",") if t.strip()]
+                        else:
+                            tokens = tokens_raw
+
+                        token_yes = tokens[0] if len(tokens) >= 1 else ""
+                        token_no = tokens[1] if len(tokens) >= 2 else ""
+
+                        logger.info("Found live market: %s (cid=%s)", slug, cid[:12])
+                        return {
+                            "slug": slug,
+                            "condition_id": cid,
+                            "token_yes": token_yes,
+                            "token_no": token_no,
+                            "end_ts": end_ts,
+                            "question": question,
+                            "event": event,
+                            "market": market,
+                        }
+        except Exception as e:
+            logger.debug("Slug %s not found: %s", slug, e)
+            continue
+
+    # Fallback: try fetching by slug directly
+    slug = f"{prefix}{period_start}"
+    try:
+        resp = requests.get(
+            f"https://gamma-api.polymarket.com/events/slug/{slug}",
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            event = resp.json()
+            markets = event.get("markets", [])
+            if markets:
+                market = markets[0]
+                import json
+                tokens_raw = market.get("clobTokenIds", "")
+                if isinstance(tokens_raw, str):
+                    try:
+                        tokens = json.loads(tokens_raw)
+                    except Exception:
+                        tokens = [t.strip() for t in tokens_raw.split(",") if t.strip()]
+                else:
+                    tokens = tokens_raw
+
+                return {
+                    "slug": slug,
+                    "condition_id": market.get("conditionId", ""),
+                    "token_yes": tokens[0] if len(tokens) >= 1 else "",
+                    "token_no": tokens[1] if len(tokens) >= 2 else "",
+                    "end_ts": period_start + interval,
+                    "question": market.get("question", "?"),
+                    "event": event,
+                    "market": market,
+                }
+    except Exception:
+        pass
+
+    logger.warning("No live market found for %s", market_type)
+    return None
+
+
 def get_market_end_timestamp(slug: str, market_type: str = "15m") -> int:
     match = re.search(r'(\d{10})$', slug)
     if not match:
@@ -357,11 +465,14 @@ async def _run_auto_sniper(bot):
         return
 
     now = int(time.time())
-    slug = find_current_market_slug(auto.market_type)
-    if not slug:
+
+    # Find current live market via Gamma API
+    live = find_live_market(auto.market_type)
+    if not live:
         return
 
-    end_ts = get_market_end_timestamp(slug, auto.market_type)
+    slug = live["slug"]
+    end_ts = live["end_ts"]
     time_left = end_ts - now
 
     if time_left <= 0:
@@ -388,7 +499,7 @@ async def _run_auto_sniper(bot):
     if not btc_now:
         return
 
-    # BTC period open price
+    # BTC period open price from kline
     kline_interval = {"5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h"}.get(auto.market_type, "15m")
     kline = get_btc_kline(kline_interval, 1)
     if not kline:
@@ -405,37 +516,49 @@ async def _run_auto_sniper(bot):
     # Direction
     if btc_change > 0:
         direction = "Up"
-        buy_outcome = "yes"
+        token_id = live["token_yes"]  # YES token = Up
     else:
         direction = "Down"
-        buy_outcome = "no"
+        token_id = live["token_no"]   # NO token = Down
 
-    # Fetch Polymarket event
-    event = fetch_event_by_slug(slug)
-    if not event:
-        return
-
-    markets = event.get("markets", [])
-    if not markets:
-        return
-
-    market = markets[0]
-    cid = market.get("conditionId", "")
-    title = market.get("question", event.get("title", "?"))
-
-    token_id = get_token_id(cid, buy_outcome)
     if not token_id:
+        logger.warning("No token_id for direction %s", direction)
         return
 
-    # Check if already too expensive
+    cid = live["condition_id"]
+    title = live["question"]
+
+    # ── MOMENTUM CHECK ────────────────────────────────────
+    # Only enter if Polymarket mid price is BELOW our entry price
+    # This means price is still rising towards our limit (momentum up)
+    # If mid > entry_price → price already above, we'd be buying on the way down
     mid = fetch_midprice(token_id)
-    if mid and mid > auto.entry_price:
-        auto.current_entered = True
-        return
+    if mid:
+        if mid > auto.entry_price:
+            # Price already above our entry — skip, would fill immediately
+            # on a potentially falling market
+            logger.info("Skip: mid %.0f¢ > entry %.0f¢ (no momentum edge)",
+                        mid * 100, auto.entry_price * 100)
+            auto.current_entered = True
+            return
 
-    # PLACE ORDER
+        if mid < auto.entry_price * 0.5:
+            # Price way too low — direction not clear despite BTC move
+            logger.info("Skip: mid %.0f¢ too far from entry %.0f¢",
+                        mid * 100, auto.entry_price * 100)
+            return
+
+    # ── PLACE ORDER ───────────────────────────────────────
+    neg_risk = False
+    try:
+        from trading import get_neg_risk
+        neg_risk = get_neg_risk(cid)
+    except Exception:
+        pass
+
     result = place_limit_buy(token_id, auto.entry_price, auto.size_usdc, cid)
     if not result or not result.get("order_id"):
+        logger.error("Failed to place order for %s", slug)
         return
 
     auto.current_entered = True
@@ -459,7 +582,8 @@ async def _run_auto_sniper(bot):
                 f"🎯 <b>AUTO-SNIPE!</b>\n\n"
                 f"📌 {title[:60]}\n"
                 f"{'🟢' if direction == 'Up' else '🔴'} {direction} @ {auto.entry_price*100:.0f}¢\n"
-                f"💵 ${auto.size_usdc:.2f}\n"
+                f"💵 ${auto.size_usdc:.2f}"
+                f"{f' | Mid: {mid*100:.0f}¢' if mid else ''}\n"
                 f"📊 BTC: ${btc_open:,.0f} → ${btc_now:,.0f} ({'+' if btc_change > 0 else ''}{btc_change:,.0f}, {btc_change_pct:.3f}%)\n"
                 f"⏱ {time_left}s left | 🛡 SL: {auto.stop_loss_cents}¢"
             ),
@@ -531,6 +655,10 @@ async def _check_session(bot, session: SnipeSession):
                     shares=session.total_shares,
                     result="STOP-LOSS",
                     pnl=pnl,
+                    enter_before_sec=_auto_sniper.enter_before_sec if _auto_sniper else 0,
+                    btc_trigger_pct=_auto_sniper.min_btc_move_pct if _auto_sniper else 0,
+                    stop_loss_cents=session.stop_loss_cents,
+                    time_left_at_entry=max(0, session.market_end_ts - session.started_at),
                 )
 
                 try:
@@ -582,6 +710,10 @@ async def _check_session(bot, session: SnipeSession):
                     shares=session.total_shares,
                     result="WIN" if won else "LOSS",
                     pnl=pnl,
+                    enter_before_sec=_auto_sniper.enter_before_sec if _auto_sniper else 0,
+                    btc_trigger_pct=_auto_sniper.min_btc_move_pct if _auto_sniper else 0,
+                    stop_loss_cents=session.stop_loss_cents,
+                    time_left_at_entry=max(0, session.market_end_ts - session.started_at),
                 )
 
                 emoji = "🟩" if won else "🟥"
@@ -634,6 +766,10 @@ def log_trade_to_sheets(
     pnl: float,
     btc_open: float = 0,
     btc_close: float = 0,
+    enter_before_sec: int = 0,
+    btc_trigger_pct: float = 0,
+    stop_loss_cents: int = 0,
+    time_left_at_entry: int = 0,
 ):
     """Log a completed sniper trade to Google Sheets '🎯 Sniper' tab."""
     try:
@@ -652,37 +788,62 @@ def log_trade_to_sheets(
             first_cell = None
 
         if not first_cell:
-            # Create headers + formulas
             headers = [
                 "Timestamp", "Market", "Type", "Direction",
                 "Entry (¢)", "Size ($)", "Shares",
                 "Result", "P&L ($)",
-                "BTC Open", "BTC Close", "BTC Change",
+                "BTC Open", "BTC Close", "BTC Δ",
+                "Enter Before (s)", "BTC Trigger (%)", "SL (¢)", "Time Left (s)",
             ]
-            ws.update("A1:L1", [headers])
+            ws.update("A1:P1", [headers])
 
-            # Summary formulas in column N
+            # Summary formulas in column R
             summary = [
                 ["STATS", ""],
                 ["Total trades", '=COUNTA(A2:A)'],
                 ["Wins", '=COUNTIF(H2:H,"WIN")'],
                 ["Losses", '=COUNTIF(H2:H,"LOSS")'],
                 ["Stop-losses", '=COUNTIF(H2:H,"STOP-LOSS")'],
-                ["Win Rate %", '=IF(N3>0,N4/(N4+N5+N6)*100,0)'],
+                ["No fills", '=COUNTIF(H2:H,"NO-FILL")'],
+                ["Win Rate %", '=IF(R3>0,R4/(R4+R5+R6)*100,0)'],
                 ["Total P&L $", '=SUM(I2:I)'],
-                ["Total Spent $", '=SUM(F2:F)'],
-                ["ROI %", '=IF(N9>0,N8/N9*100,0)'],
-                ["Avg Win $", '=IF(N4>0,SUMIF(H2:H,"WIN",I2:I)/N4,0)'],
-                ["Avg Loss $", '=IF((N5+N6)>0,(SUMIF(H2:H,"LOSS",I2:I)+SUMIF(H2:H,"STOP-LOSS",I2:I))/(N5+N6),0)'],
+                ["Total Spent $", '=SUMIF(H2:H,"<>NO-FILL",F2:F)'],
+                ["ROI %", '=IF(R10>0,R9/R10*100,0)'],
+                ["Avg Win $", '=IF(R4>0,SUMIF(H2:H,"WIN",I2:I)/R4,0)'],
+                ["Avg Loss $", '=IF((R5+R6)>0,(SUMIF(H2:H,"LOSS",I2:I)+SUMIF(H2:H,"STOP-LOSS",I2:I))/(R5+R6),0)'],
                 ["Best Trade $", '=MAX(I2:I)'],
                 ["Worst Trade $", '=MIN(I2:I)'],
+                ["", ""],
+                ["BY TIMING", ""],
+                ["30s trades", '=COUNTIF(M2:M,30)'],
+                ["30s WR%", '=IF(R18>0, COUNTIFS(M2:M,30,H2:H,"WIN")/COUNTIFS(M2:M,30,H2:H,"<>NO-FILL")*100, 0)'],
+                ["60s trades", '=COUNTIF(M2:M,60)'],
+                ["60s WR%", '=IF(R20>0, COUNTIFS(M2:M,60,H2:H,"WIN")/COUNTIFS(M2:M,60,H2:H,"<>NO-FILL")*100, 0)'],
+                ["120s trades", '=COUNTIF(M2:M,120)'],
+                ["120s WR%", '=IF(R22>0, COUNTIFS(M2:M,120,H2:H,"WIN")/COUNTIFS(M2:M,120,H2:H,"<>NO-FILL")*100, 0)'],
+                ["180s trades", '=COUNTIF(M2:M,180)'],
+                ["180s WR%", '=IF(R24>0, COUNTIFS(M2:M,180,H2:H,"WIN")/COUNTIFS(M2:M,180,H2:H,"<>NO-FILL")*100, 0)'],
+                ["", ""],
+                ["BY ENTRY PRICE", ""],
+                ["80¢ WR%", '=IF(COUNTIF(E2:E,80)>0, COUNTIFS(E2:E,80,H2:H,"WIN")/COUNTIFS(E2:E,80,H2:H,"<>NO-FILL")*100, 0)'],
+                ["83¢ WR%", '=IF(COUNTIF(E2:E,83)>0, COUNTIFS(E2:E,83,H2:H,"WIN")/COUNTIFS(E2:E,83,H2:H,"<>NO-FILL")*100, 0)'],
+                ["85¢ WR%", '=IF(COUNTIF(E2:E,85)>0, COUNTIFS(E2:E,85,H2:H,"WIN")/COUNTIFS(E2:E,85,H2:H,"<>NO-FILL")*100, 0)'],
+                ["88¢ WR%", '=IF(COUNTIF(E2:E,88)>0, COUNTIFS(E2:E,88,H2:H,"WIN")/COUNTIFS(E2:E,88,H2:H,"<>NO-FILL")*100, 0)'],
+                ["", ""],
+                ["BY BTC TRIGGER", ""],
+                ["0.01% WR%", '=IF(COUNTIF(N2:N,0.01)>0, COUNTIFS(N2:N,0.01,H2:H,"WIN")/COUNTIFS(N2:N,0.01,H2:H,"<>NO-FILL")*100, 0)'],
+                ["0.03% WR%", '=IF(COUNTIF(N2:N,0.03)>0, COUNTIFS(N2:N,0.03,H2:H,"WIN")/COUNTIFS(N2:N,0.03,H2:H,"<>NO-FILL")*100, 0)'],
+                ["0.05% WR%", '=IF(COUNTIF(N2:N,0.05)>0, COUNTIFS(N2:N,0.05,H2:H,"WIN")/COUNTIFS(N2:N,0.05,H2:H,"<>NO-FILL")*100, 0)'],
+                ["0.10% WR%", '=IF(COUNTIF(N2:N,0.1)>0, COUNTIFS(N2:N,0.1,H2:H,"WIN")/COUNTIFS(N2:N,0.1,H2:H,"<>NO-FILL")*100, 0)'],
             ]
-            ws.update("N1:O13", summary)
+            ws.update("R1:S36", summary)
 
-            # Format header row bold
             try:
-                ws.format("A1:L1", {"textFormat": {"bold": True}})
-                ws.format("N1:O1", {"textFormat": {"bold": True}})
+                ws.format("A1:P1", {"textFormat": {"bold": True}})
+                ws.format("R1:S1", {"textFormat": {"bold": True}})
+                ws.format("R17:S17", {"textFormat": {"bold": True}})
+                ws.format("R27:S27", {"textFormat": {"bold": True}})
+                ws.format("R32:S32", {"textFormat": {"bold": True}})
             except Exception:
                 pass
 
@@ -701,10 +862,14 @@ def log_trade_to_sheets(
             round(btc_open, 2) if btc_open else "",
             round(btc_close, 2) if btc_close else "",
             btc_change if btc_change else "",
+            enter_before_sec,
+            btc_trigger_pct,
+            stop_loss_cents,
+            time_left_at_entry,
         ]
         ws.append_row(row, value_input_option="USER_ENTERED")
-        logger.info("Logged sniper trade to sheets: %s %s %.0f¢ %s $%.2f",
-                     direction, result, entry_price * 100, market_type, pnl)
+        logger.info("Logged trade: %s %s %.0f¢ %ss %s $%.2f",
+                     direction, result, entry_price * 100, enter_before_sec, market_type, pnl)
 
     except Exception as e:
         logger.error("Sheets logging error: %s", e)
@@ -743,8 +908,8 @@ def format_auto_status() -> str:
         f"🤖 <b>Auto-Sniper {'🟢 ON' if auto.active else '🔴 OFF'}</b>\n\n"
         f"⚙️ {auto.market_type} | Entry: {auto.entry_price*100:.0f}¢ | ${auto.size_usdc:.2f}/trade\n"
         f"⏱ Enter {auto.enter_before_sec}s before close\n"
-        f"📊 BTC trigger: ≥{auto.min_btc_move_pct:.2f}% move\n"
-        f"🛡 Stop-loss: {auto.stop_loss_cents}¢\n\n"
+        f"📊 BTC trigger: ≥{auto.min_btc_move_pct:.2f}%\n"
+        f"🛡 SL: {auto.stop_loss_cents}¢ | 🔒 Momentum ON\n\n"
         f"📈 Trades: {auto.total_trades} | {auto.wins}W/{auto.losses}L ({wr:.0f}%)\n"
         f"💰 P&L: {sign}${auto.total_pnl:.2f}\n"
         f"⏱ {hours}h {mins}m"
