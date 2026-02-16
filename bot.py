@@ -1207,9 +1207,9 @@ async def snipe_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         setup["step"] = "auto_size"
 
         buttons = [
-            [InlineKeyboardButton("$0.50", callback_data="snipe_asize:0.5"),
-             InlineKeyboardButton("$1", callback_data="snipe_asize:1")],
-            [InlineKeyboardButton("$2", callback_data="snipe_asize:2"),
+            [InlineKeyboardButton("$1", callback_data="snipe_asize:1"),
+             InlineKeyboardButton("$2", callback_data="snipe_asize:2")],
+            [InlineKeyboardButton("$3", callback_data="snipe_asize:3"),
              InlineKeyboardButton("$5", callback_data="snipe_asize:5")],
         ]
         await query.edit_message_text(
