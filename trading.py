@@ -120,6 +120,7 @@ def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_i
     """
     Place a BUY order (GTC).
     All orders go as GTC — sits in book if no match, executes if price matches.
+    Automatically detects neg_risk markets (BTC up/down etc).
     """
     client = _get_client()
     if not client:
@@ -145,15 +146,23 @@ def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_i
             token_id=token_id,
         )
 
+        # Check if market is neg_risk (BTC up/down markets are)
+        neg_risk = False
+        if condition_id:
+            neg_risk = get_neg_risk(condition_id)
+
         signed = client.create_order(order_args)
         try:
-            resp = client.post_order(signed, orderType=OrderType.GTC)
+            resp = client.post_order(signed, orderType=OrderType.GTC, neg_risk=neg_risk)
         except TypeError:
             try:
-                resp = client.post_order(signed, OrderType.GTC)
+                resp = client.post_order(signed, OrderType.GTC, neg_risk=neg_risk)
             except TypeError:
-                resp = client.post_order(signed)
-        logger.info("BUY GTC order: price=%s size=%s resp=%s", price, size, resp)
+                try:
+                    resp = client.post_order(signed, OrderType.GTC)
+                except TypeError:
+                    resp = client.post_order(signed)
+        logger.info("BUY GTC order: price=%s size=%s neg_risk=%s resp=%s", price, size, neg_risk, resp)
 
         return {"order_id": resp.get("orderID", ""), "price": price, "size": size, "response": resp}
 
@@ -202,7 +211,7 @@ def place_limit_sell(token_id: str, price: float, size: float, condition_id: str
 def place_market_sell(token_id: str, size: float, condition_id: str = "") -> dict | None:
     """
     Place a market SELL order (FOK) — immediate execution.
-    Used for auto-sell when tracked trader sells.
+    Used for auto-sell when tracked trader sells, and for stop-loss.
     """
     client = _get_client()
     if not client:
@@ -220,12 +229,20 @@ def place_market_sell(token_id: str, size: float, condition_id: str = "") -> dic
             side=SELL,
         )
 
+        # Check neg_risk
+        neg_risk = False
+        if condition_id:
+            neg_risk = get_neg_risk(condition_id)
+
         signed = client.create_market_order(mo)
         try:
-            resp = client.post_order(signed, OrderType.FOK)
+            resp = client.post_order(signed, OrderType.FOK, neg_risk=neg_risk)
         except TypeError:
-            resp = client.post_order(signed)
-        logger.info("Market SELL executed: size=%s resp=%s", size, resp)
+            try:
+                resp = client.post_order(signed, OrderType.FOK)
+            except TypeError:
+                resp = client.post_order(signed)
+        logger.info("Market SELL executed: size=%s neg_risk=%s resp=%s", size, neg_risk, resp)
         return {"order_id": resp.get("orderID", ""), "size": size, "response": resp}
 
     except Exception as e:
