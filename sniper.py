@@ -30,6 +30,16 @@ _sessions: dict[str, "SnipeSession"] = {}
 _auto_sniper: "AutoSniper | None" = None
 
 
+async def _notify(bot, text: str):
+    """Send notification to owner AND channel."""
+    from config import OWNER_ID, CHANNEL_ID
+    for chat_id in [OWNER_ID, CHANNEL_ID]:
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        except Exception as e:
+            logger.debug("Notify error %s: %s", chat_id, e)
+
+
 @dataclass
 class SnipeSession:
     """One active sniper on a specific market."""
@@ -577,18 +587,14 @@ async def _run_auto_sniper(bot):
     _sessions[cid] = session
 
     try:
-        await bot.send_message(
-            chat_id=OWNER_ID,
-            text=(
-                f"🎯 <b>AUTO-SNIPE!</b>\n\n"
-                f"📌 {title[:60]}\n"
-                f"{'🟢' if direction == 'Up' else '🔴'} {direction} @ {auto.entry_price*100:.0f}¢\n"
-                f"💵 ${auto.size_usdc:.2f}"
-                f"{f' | Mid: {mid*100:.0f}¢' if mid else ''}\n"
-                f"📊 BTC: ${btc_open:,.0f} → ${btc_now:,.0f} ({'+' if btc_change > 0 else ''}{btc_change:,.0f}, {btc_change_pct:.3f}%)\n"
-                f"⏱ {time_left}s left | 🛡 SL: {auto.stop_loss_cents}¢"
-            ),
-            parse_mode="HTML",
+        await _notify(bot,
+            f"🎯 <b>AUTO-SNIPE!</b>\n\n"
+            f"📌 {title[:60]}\n"
+            f"{'🟢' if direction == 'Up' else '🔴'} {direction} @ {auto.entry_price*100:.0f}¢\n"
+            f"💵 ${auto.size_usdc:.2f}"
+            f"{f' | Mid: {mid*100:.0f}¢' if mid else ''}\n"
+            f"📊 BTC: ${btc_open:,.0f} → ${btc_now:,.0f} ({'+' if btc_change > 0 else ''}{btc_change:,.0f}, {btc_change_pct:.3f}%)\n"
+            f"⏱ {time_left}s left | 🛡 SL: {auto.stop_loss_cents}¢"
         )
     except Exception:
         pass
@@ -597,7 +603,7 @@ async def _run_auto_sniper(bot):
 async def _check_session(bot, session: SnipeSession):
     """Check fill, stop-loss, resolution."""
     from trading import check_order_status, cancel_order, place_market_sell
-    from config import OWNER_ID
+    from config import OWNER_ID, CHANNEL_ID
 
     now = int(time.time())
 
@@ -618,16 +624,12 @@ async def _check_session(bot, session: SnipeSession):
             session.mid_at_fill = fill_mid if fill_mid else 0
 
             try:
-                await bot.send_message(
-                    chat_id=OWNER_ID,
-                    text=(
-                        f"✅ <b>FILL!</b> {session.outcome} @ {session.entry_price*100:.0f}¢\n"
-                        f"📌 {session.title[:50]}\n"
-                        f"📊 {shares:.1f} shares = ${session.size_usdc:.2f}\n"
-                        f"📈 Mid at fill: {session.mid_at_fill*100:.0f}¢\n"
-                        f"⏳ Чекаємо resolution..."
-                    ),
-                    parse_mode="HTML",
+                await _notify(bot,
+                    f"✅ <b>FILL!</b> {session.outcome} @ {session.entry_price*100:.0f}¢\n"
+                    f"📌 {session.title[:50]}\n"
+                    f"📊 {shares:.1f} shares = ${session.size_usdc:.2f}\n"
+                    f"📈 Mid at fill: {session.mid_at_fill*100:.0f}¢\n"
+                    f"⏳ Чекаємо resolution..."
                 )
             except Exception:
                 pass
@@ -672,16 +674,12 @@ async def _check_session(bot, session: SnipeSession):
                     )
 
                     try:
-                        await bot.send_message(
-                            chat_id=OWNER_ID,
-                            text=(
-                                f"🛑 <b>STOP-LOSS!</b>\n"
-                                f"📌 {session.title[:50]}\n"
-                                f"Mid at fill: {session.mid_at_fill*100:.0f}¢ → Now: {mid*100:.0f}¢ (drop {drop*100:.0f}¢)\n"
-                                f"💰 ${pnl:.2f}"
-                                + (f"\n📈 {_auto_sniper.wins}W/{_auto_sniper.losses}L = ${_auto_sniper.total_pnl:.2f}" if _auto_sniper else "")
-                            ),
-                            parse_mode="HTML",
+                        await _notify(bot,
+                            f"🛑 <b>STOP-LOSS!</b>\n"
+                            f"📌 {session.title[:50]}\n"
+                            f"Mid at fill: {session.mid_at_fill*100:.0f}¢ → Now: {mid*100:.0f}¢ (drop {drop*100:.0f}¢)\n"
+                            f"💰 ${pnl:.2f}"
+                            + (f"\n📈 {_auto_sniper.wins}W/{_auto_sniper.losses}L = ${_auto_sniper.total_pnl:.2f}" if _auto_sniper else "")
                         )
                     except Exception:
                         pass
@@ -728,15 +726,11 @@ async def _check_session(bot, session: SnipeSession):
 
                 emoji = "🟩" if won else "🟥"
                 try:
-                    await bot.send_message(
-                        chat_id=OWNER_ID,
-                        text=(
-                            f"{emoji} <b>{'WIN' if won else 'LOSS'}!</b> {session.outcome} @ {session.entry_price*100:.0f}¢\n"
-                            f"📌 {session.title[:50]}\n"
-                            f"Resolved: {resolution} | 💰 {'+'if pnl>=0 else ''}${pnl:.2f}"
-                            + (f"\n📈 {_auto_sniper.wins}W/{_auto_sniper.losses}L = ${_auto_sniper.total_pnl:.2f}" if _auto_sniper else "")
-                        ),
-                        parse_mode="HTML",
+                    await _notify(bot,
+                        f"{emoji} <b>{'WIN' if won else 'LOSS'}!</b> {session.outcome} @ {session.entry_price*100:.0f}¢\n"
+                        f"📌 {session.title[:50]}\n"
+                        f"Resolved: {resolution} | 💰 {'+'if pnl>=0 else ''}${pnl:.2f}"
+                        + (f"\n📈 {_auto_sniper.wins}W/{_auto_sniper.losses}L = ${_auto_sniper.total_pnl:.2f}" if _auto_sniper else "")
                     )
                 except Exception:
                     pass
