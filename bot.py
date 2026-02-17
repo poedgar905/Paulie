@@ -1188,8 +1188,10 @@ async def snipe_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         setup["step"] = "auto_price"
 
         buttons = [
-            [InlineKeyboardButton("80¢", callback_data="snipe_aprice:80"),
-             InlineKeyboardButton("83¢", callback_data="snipe_aprice:83")],
+            [InlineKeyboardButton("65¢", callback_data="snipe_aprice:65"),
+             InlineKeyboardButton("70¢", callback_data="snipe_aprice:70")],
+            [InlineKeyboardButton("75¢", callback_data="snipe_aprice:75"),
+             InlineKeyboardButton("80¢", callback_data="snipe_aprice:80")],
             [InlineKeyboardButton("85¢", callback_data="snipe_aprice:85"),
              InlineKeyboardButton("88¢", callback_data="snipe_aprice:88")],
         ]
