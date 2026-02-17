@@ -737,7 +737,7 @@ async def _check_session(bot, session: SnipeSession):
         now = int(time.time())
         time_since_end = now - session.market_end_ts
 
-        if time_since_end > 30:
+        if time_since_end > 15:
             # Try Gamma API first
             market = fetch_market_by_condition(session.condition_id)
             resolved_via = ""
@@ -757,26 +757,49 @@ async def _check_session(bot, session: SnipeSession):
                     logger.info("Resolution via API: %s -> %s (won=%s)", session.outcome, resolution, won)
 
             # Fallback: if no resolution after 3 minutes, check BTC price
-            if not resolved_via and time_since_end > 180:
-                btc_now = get_btc_price()
-                kline_interval = {"5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h"}.get(
-                    _auto_sniper.market_type if _auto_sniper else "15m", "15m")
-                kline = get_btc_kline(kline_interval, 2)  # Get previous completed kline
+            if not resolved_via and time_since_end > 120:
+                # Get the kline that matches our market period
+                # Market end_ts = period start + interval
+                # We need the kline that STARTED at (end_ts - interval)
+                try:
+                    import requests as _req
+                    interval_sec = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400}.get(
+                        _auto_sniper.market_type if _auto_sniper else "15m", 900)
+                    kline_interval = {"5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h"}.get(
+                        _auto_sniper.market_type if _auto_sniper else "15m", "15m")
 
-                if btc_now and kline:
-                    btc_open = kline["open"]
-                    btc_close = kline["close"]
-                    # Use kline close (completed candle) to determine result
-                    if btc_close > btc_open:
-                        resolution = "Up"
-                    elif btc_close < btc_open:
-                        resolution = "Down"
-                    else:
-                        resolution = "Up"  # Tie = Up on Polymarket
+                    # Fetch kline that started at our market start time
+                    market_start_ms = (session.market_end_ts - interval_sec) * 1000
+                    resp = _req.get(
+                        "https://api.binance.com/api/v3/klines",
+                        params={
+                            "symbol": "BTCUSDT",
+                            "interval": kline_interval,
+                            "startTime": market_start_ms,
+                            "limit": 1,
+                        },
+                        timeout=5,
+                    )
+                    if resp.status_code == 200:
+                        candles = resp.json()
+                        if candles:
+                            k = candles[0]
+                            btc_open = float(k[1])
+                            btc_close = float(k[4])
 
-                    won = _check_win(session.outcome, resolution)
-                    resolved_via = "BTC"
-                    logger.info("Resolution via BTC fallback: %s -> %s (won=%s)", session.outcome, resolution, won)
+                            if btc_close > btc_open:
+                                resolution = "Up"
+                            elif btc_close < btc_open:
+                                resolution = "Down"
+                            else:
+                                resolution = "Up"
+
+                            won = _check_win(session.outcome, resolution)
+                            resolved_via = "BTC"
+                            logger.info("BTC fallback: open=%.0f close=%.0f -> %s (we=%s, won=%s)",
+                                        btc_open, btc_close, resolution, session.outcome, won)
+                except Exception as e:
+                    logger.error("BTC fallback error: %s", e)
 
             # Force resolve after 10 minutes no matter what
             if not resolved_via and time_since_end > 600:
