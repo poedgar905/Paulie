@@ -27,7 +27,8 @@ logger = logging.getLogger(__name__)
 
 # ── Active sessions ──────────────────────────────────────────
 _sessions: dict[str, "SnipeSession"] = {}
-_auto_sniper: "AutoSniper | None" = None
+_auto_snipers: dict[str, "AutoSniper"] = {}  # key = market_type
+_SAVE_PATH = "snipers_config.json"
 
 
 async def _notify(bot, text: str):
@@ -218,14 +219,33 @@ class AutoSniper:
     started_at: int = 0
 
 
+def _get_sniper_for_session(session) -> "AutoSniper | None":
+    """Find auto-sniper that owns this session."""
+    for s in _auto_snipers.values():
+        if s.current_cid == session.condition_id:
+            return s
+    for s in _auto_snipers.values():
+        if s.active:
+            return s
+    return None
+
+
 def get_session(cid: str) -> SnipeSession | None:
     return _sessions.get(cid)
 
 def get_all_sessions() -> list[SnipeSession]:
     return list(_sessions.values())
 
-def get_auto_sniper() -> "AutoSniper | None":
-    return _auto_sniper
+def get_auto_sniper(market_type: str = None) -> "AutoSniper | None":
+    if market_type:
+        return _auto_snipers.get(market_type)
+    for s in _auto_snipers.values():
+        if s.active:
+            return s
+    return None
+
+def get_all_auto_snipers() -> list["AutoSniper"]:
+    return list(_auto_snipers.values())
 
 def remove_session(cid: str):
     _sessions.pop(cid, None)
@@ -518,8 +538,7 @@ def start_auto_sniper(
     market_type="15m", entry_price=0.85, size_usdc=1.0,
     stop_loss_cents=10, enter_before_sec=180, min_btc_move_pct=0.03,
 ) -> AutoSniper:
-    global _auto_sniper
-    _auto_sniper = AutoSniper(
+    sniper = AutoSniper(
         active=True, market_type=market_type,
         entry_price=entry_price, size_usdc=size_usdc,
         stop_loss_cents=stop_loss_cents,
@@ -527,16 +546,25 @@ def start_auto_sniper(
         min_btc_move_pct=min_btc_move_pct,
         started_at=int(time.time()),
     )
-    return _auto_sniper
-
-
-def stop_auto_sniper() -> AutoSniper | None:
-    global _auto_sniper
-    sniper = _auto_sniper
-    if sniper:
-        sniper.active = False
-        _auto_sniper = None
+    _auto_snipers[market_type] = sniper
+    _save_config()
     return sniper
+
+
+def stop_auto_sniper(market_type: str = None) -> "AutoSniper | None":
+    if market_type:
+        sniper = _auto_snipers.pop(market_type, None)
+        if sniper:
+            sniper.active = False
+        _save_config()
+        return sniper
+    stopped = None
+    for mt in list(_auto_snipers.keys()):
+        s = _auto_snipers.pop(mt)
+        s.active = False
+        stopped = s
+    _save_config()
+    return stopped
 
 
 def stop_all() -> tuple[list[SnipeSession], "AutoSniper | None"]:
@@ -548,25 +576,102 @@ def stop_all() -> tuple[list[SnipeSession], "AutoSniper | None"]:
         if s.order_id and s.order_status == "live":
             cancel_order(s.order_id)
         stopped.append(s)
-    auto = stop_auto_sniper()
-    return stopped, auto
+    stopped_snipers = []
+    for mt in list(_auto_snipers.keys()):
+        s = _auto_snipers.pop(mt)
+        s.active = False
+        stopped_snipers.append(s)
+    _save_config()
+    return stopped, stopped_snipers
 
 
 # ── Background checker ───────────────────────────────────────
 
+def _save_config():
+    """Save sniper configs to JSON for persistence across restarts."""
+    import json
+    configs = []
+    for s in _auto_snipers.values():
+        if s.active:
+            configs.append({
+                "market_type": s.market_type,
+                "entry_price": s.entry_price,
+                "size_usdc": s.size_usdc,
+                "stop_loss_cents": s.stop_loss_cents,
+                "enter_before_sec": s.enter_before_sec,
+                "min_btc_move_pct": s.min_btc_move_pct,
+                "wins": s.wins,
+                "losses": s.losses,
+                "total_pnl": round(s.total_pnl, 4),
+                "total_trades": s.total_trades,
+            })
+    try:
+        with open(_SAVE_PATH, "w") as f:
+            json.dump(configs, f)
+    except Exception as e:
+        logger.error("Save config error: %s", e)
+
+
+def load_saved_snipers() -> int:
+    """Load saved sniper configs on startup. Returns count loaded."""
+    import json
+    try:
+        with open(_SAVE_PATH, "r") as f:
+            configs = json.load(f)
+        count = 0
+        for cfg in configs:
+            s = AutoSniper(
+                active=True,
+                market_type=cfg["market_type"],
+                entry_price=cfg["entry_price"],
+                size_usdc=cfg["size_usdc"],
+                stop_loss_cents=cfg["stop_loss_cents"],
+                enter_before_sec=cfg["enter_before_sec"],
+                min_btc_move_pct=cfg["min_btc_move_pct"],
+                wins=cfg.get("wins", 0),
+                losses=cfg.get("losses", 0),
+                total_pnl=cfg.get("total_pnl", 0),
+                total_trades=cfg.get("total_trades", 0),
+                started_at=int(time.time()),
+            )
+            _auto_snipers[cfg["market_type"]] = s
+            count += 1
+            logger.info("Restored sniper: %s %.0f¢ $%.0f",
+                        cfg["market_type"], cfg["entry_price"]*100, cfg["size_usdc"])
+        return count
+    except FileNotFoundError:
+        return 0
+    except Exception as e:
+        logger.error("Load config error: %s", e)
+        return 0
+
 async def sniper_checker(bot):
-    """Main loop — every 3 seconds."""
+    """Main loop — every 1.5 seconds."""
     from config import OWNER_ID
-    logger.info("Sniper checker started (3s)")
-    await asyncio.sleep(5)
+    logger.info("Sniper checker started (1.5s)")
+    await asyncio.sleep(3)
+
+    # Auto-restore saved snipers
+    count = load_saved_snipers()
+    if count > 0:
+        try:
+            lines = []
+            for s in _auto_snipers.values():
+                lines.append(f"  • {s.market_type} | {s.entry_price*100:.0f}¢ | ${s.size_usdc:.0f} | {s.enter_before_sec}s")
+            await _notify(bot,
+                f"🔄 <b>Auto-restored {count} sniper(s)</b>\n" + "\n".join(lines)
+            )
+        except Exception:
+            pass
 
     while True:
         try:
-            if _auto_sniper and _auto_sniper.active:
-                try:
-                    await _run_auto_sniper(bot)
-                except Exception as e:
-                    logger.error("Auto-sniper error: %s", e)
+            for mt, sniper in list(_auto_snipers.items()):
+                if sniper.active:
+                    try:
+                        await _run_auto_sniper(bot, sniper)
+                    except Exception as e:
+                        logger.error("Auto-sniper %s error: %s", mt, e)
 
             for cid, session in list(_sessions.items()):
                 if not session.active:
@@ -584,15 +689,14 @@ async def sniper_checker(bot):
         except Exception as e:
             logger.error("Sniper loop error: %s", e)
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(1.5)
 
 
-async def _run_auto_sniper(bot):
+async def _run_auto_sniper(bot, auto: AutoSniper):
     """Auto-sniper: wait for entry window, check BTC, enter."""
     from trading import place_limit_buy
     from config import OWNER_ID
 
-    auto = _auto_sniper
     if not auto or not auto.active:
         return
 
@@ -781,6 +885,7 @@ async def _check_session(bot, session: SnipeSession):
     from trading import check_order_status, cancel_order, place_market_sell
     from config import OWNER_ID, CHANNEL_ID
 
+    _sniper = _get_sniper_for_session(session)
     now = int(time.time())
 
     # ── Check fill ────────────────────────────────────────
@@ -828,23 +933,24 @@ async def _check_session(bot, session: SnipeSession):
                     place_market_sell(session.token_id, session.total_shares, session.condition_id)
                     pnl = (mid * session.total_shares) - session.total_spent
 
-                    if _auto_sniper:
-                        _auto_sniper.losses += 1
-                        _auto_sniper.total_pnl += pnl
+                    if _sniper:
+                        _sniper.losses += 1
+                        _sniper.total_pnl += pnl
+                        _save_config()
 
                     from datetime import datetime, timezone
                     log_trade_to_sheets(
                         timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
                         market_title=session.title,
-                        market_type=_auto_sniper.market_type if _auto_sniper else "manual",
+                        market_type=_sniper.market_type if _sniper else "manual",
                         direction=session.outcome,
                         entry_price=session.entry_price,
                         size_usdc=session.total_spent,
                         shares=session.total_shares,
                         result="STOP-LOSS",
                         pnl=pnl,
-                        enter_before_sec=_auto_sniper.enter_before_sec if _auto_sniper else 0,
-                        btc_trigger_pct=_auto_sniper.min_btc_move_pct if _auto_sniper else 0,
+                        enter_before_sec=_sniper.enter_before_sec if _sniper else 0,
+                        btc_trigger_pct=_sniper.min_btc_move_pct if _sniper else 0,
                         stop_loss_cents=session.stop_loss_cents,
                         time_left_at_entry=max(0, session.market_end_ts - session.started_at),
                     )
@@ -855,7 +961,7 @@ async def _check_session(bot, session: SnipeSession):
                             f"📌 {session.title[:50]}\n"
                             f"Mid at fill: {session.mid_at_fill*100:.0f}¢ → Now: {mid*100:.0f}¢ (drop {drop*100:.0f}¢)\n"
                             f"💰 ${pnl:.2f}"
-                            + (f"\n📈 {_auto_sniper.wins}W/{_auto_sniper.losses}L = ${_auto_sniper.total_pnl:.2f}" if _auto_sniper else "")
+                            + (f"\n📈 {_sniper.wins}W/{_sniper.losses}L = ${_sniper.total_pnl:.2f}" if _sniper else "")
                         )
                     except Exception:
                         pass
@@ -896,9 +1002,9 @@ async def _check_session(bot, session: SnipeSession):
                 try:
                     import requests as _req
                     interval_sec = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400}.get(
-                        _auto_sniper.market_type if _auto_sniper else "15m", 900)
+                        _sniper.market_type if _sniper else "15m", 900)
                     kline_interval = {"5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h"}.get(
-                        _auto_sniper.market_type if _auto_sniper else "15m", "15m")
+                        _sniper.market_type if _sniper else "15m", "15m")
 
                     # Fetch kline that started at our market start time
                     market_start_ms = (session.market_end_ts - interval_sec) * 1000
@@ -946,27 +1052,28 @@ async def _check_session(bot, session: SnipeSession):
                 shares = session.total_shares
                 pnl = (shares * 1.0 - session.total_spent) if won else -session.total_spent
 
-                if _auto_sniper:
+                if _sniper:
                     if won:
-                        _auto_sniper.wins += 1
+                        _sniper.wins += 1
                     else:
-                        _auto_sniper.losses += 1
-                    _auto_sniper.total_pnl += pnl
+                        _sniper.losses += 1
+                    _sniper.total_pnl += pnl
+                    _save_config()
 
                 # Log to sheets
                 from datetime import datetime, timezone
                 log_trade_to_sheets(
                     timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
                     market_title=session.title,
-                    market_type=_auto_sniper.market_type if _auto_sniper else "manual",
+                    market_type=_sniper.market_type if _sniper else "manual",
                     direction=session.outcome,
                     entry_price=session.entry_price,
                     size_usdc=session.total_spent,
                     shares=session.total_shares,
                     result="WIN" if won else "LOSS",
                     pnl=pnl,
-                    enter_before_sec=_auto_sniper.enter_before_sec if _auto_sniper else 0,
-                    btc_trigger_pct=_auto_sniper.min_btc_move_pct if _auto_sniper else 0,
+                    enter_before_sec=_sniper.enter_before_sec if _sniper else 0,
+                    btc_trigger_pct=_sniper.min_btc_move_pct if _sniper else 0,
                     stop_loss_cents=session.stop_loss_cents,
                     time_left_at_entry=max(0, session.market_end_ts - session.started_at),
                 )
@@ -977,7 +1084,7 @@ async def _check_session(bot, session: SnipeSession):
                         f"{emoji} <b>{'WIN' if won else 'LOSS'}!</b> {session.outcome} @ {session.entry_price*100:.0f}¢\n"
                         f"📌 {session.title[:50]}\n"
                         f"Resolved: {resolution} ({resolved_via}) | 💰 {'+'if pnl>=0 else ''}${pnl:.2f}"
-                        + (f"\n📈 {_auto_sniper.wins}W/{_auto_sniper.losses}L = ${_auto_sniper.total_pnl:.2f}" if _auto_sniper else "")
+                        + (f"\n📈 {_sniper.wins}W/{_sniper.losses}L = ${_sniper.total_pnl:.2f}" if _sniper else "")
                     )
                 except Exception:
                     pass
@@ -1141,28 +1248,43 @@ def format_session_status(session: SnipeSession) -> str:
 
 
 def format_auto_status() -> str:
-    auto = _auto_sniper
-    if not auto:
+    if not _auto_snipers:
         return "🎯 Auto-sniper OFF."
 
-    runtime = int(time.time()) - auto.started_at
-    hours, mins = runtime // 3600, (runtime % 3600) // 60
-    total = auto.wins + auto.losses
-    wr = (auto.wins / total * 100) if total > 0 else 0
-    sign = "+" if auto.total_pnl >= 0 else ""
+    parts = []
+    total_pnl = 0
+    total_wins = 0
+    total_losses = 0
+
+    for auto in _auto_snipers.values():
+        runtime = int(time.time()) - auto.started_at
+        hours, mins = runtime // 3600, (runtime % 3600) // 60
+        total = auto.wins + auto.losses
+        wr = (auto.wins / total * 100) if total > 0 else 0
+        sign = "+" if auto.total_pnl >= 0 else ""
+
+        parts.append(
+            f"{'🟢' if auto.active else '🔴'} <b>{auto.market_type}</b> | "
+            f"{auto.entry_price*100:.0f}¢ | ${auto.size_usdc:.0f} | "
+            f"{auto.enter_before_sec}s | BTC≥{auto.min_btc_move_pct:.2f}%\n"
+            f"   📈 {auto.total_trades}T | {auto.wins}W/{auto.losses}L ({wr:.0f}%) | "
+            f"{sign}${auto.total_pnl:.2f} | {hours}h{mins}m"
+        )
+        total_pnl += auto.total_pnl
+        total_wins += auto.wins
+        total_losses += auto.losses
 
     active = ""
     for s in _sessions.values():
         active += f"\n  {format_session_status(s)}"
 
+    total_all = total_wins + total_losses
+    total_wr = (total_wins / total_all * 100) if total_all > 0 else 0
+    total_sign = "+" if total_pnl >= 0 else ""
+
     return (
-        f"🤖 <b>Auto-Sniper {'🟢 ON' if auto.active else '🔴 OFF'}</b>\n\n"
-        f"⚙️ {auto.market_type} | Entry: {auto.entry_price*100:.0f}¢ | ${auto.size_usdc:.2f}/trade\n"
-        f"⏱ Enter {auto.enter_before_sec}s before close\n"
-        f"📊 BTC trigger: ≥{auto.min_btc_move_pct:.2f}%\n"
-        f"🛡 SL: {auto.stop_loss_cents}¢ | 🔒 Momentum ON\n\n"
-        f"📈 Trades: {auto.total_trades} | {auto.wins}W/{auto.losses}L ({wr:.0f}%)\n"
-        f"💰 P&L: {sign}${auto.total_pnl:.2f}\n"
-        f"⏱ {hours}h {mins}m"
-        f"{active}"
+        f"🤖 <b>Auto-Snipers ({len(_auto_snipers)})</b>\n\n"
+        + "\n\n".join(parts)
+        + f"\n\n💰 <b>Total: {total_wins}W/{total_losses}L ({total_wr:.0f}%) | {total_sign}${total_pnl:.2f}</b>"
+        + active
     )
