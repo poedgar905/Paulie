@@ -1101,52 +1101,55 @@ async def snipe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def snipe_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show all active snipers + auto-sniper."""
-    from sniper import get_all_sessions, format_session_status, format_auto_status, get_auto_sniper
+    from sniper import get_all_sessions, format_session_status, format_auto_status, get_all_auto_snipers
 
-    auto = get_auto_sniper()
-    if auto:
+    snipers = get_all_auto_snipers()
+    if snipers:
         await update.message.reply_text(format_auto_status(), parse_mode=ParseMode.HTML)
 
     sessions = get_all_sessions()
-    if not sessions and not auto:
+    if not sessions and not snipers:
         await update.message.reply_text("🎯 Немає активних снайперів.")
 
 
 @owner_only
 async def snipe_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Stop all snipers."""
-    from sniper import stop_all, format_auto_status
+    from sniper import stop_all
 
-    stopped_sessions, auto = stop_all()
+    stopped_sessions, stopped_snipers = stop_all()
 
-    if not stopped_sessions and not auto:
+    if not stopped_sessions and not stopped_snipers:
         await update.message.reply_text("🎯 Немає активних снайперів.")
         return
 
     text = "🛑 <b>All snipers stopped</b>\n\n"
-    if auto:
-        total = auto.wins + auto.losses
-        wr = (auto.wins / total * 100) if total > 0 else 0
-        sign = "+" if auto.total_pnl >= 0 else ""
-        text += (
-            f"📈 Trades: {auto.total_trades}\n"
-            f"🏆 {auto.wins}W / {auto.losses}L ({wr:.0f}%)\n"
-            f"💰 P&L: {sign}${auto.total_pnl:.2f}"
-        )
+    total_wins = sum(s.wins for s in stopped_snipers)
+    total_losses = sum(s.losses for s in stopped_snipers)
+    total_pnl = sum(s.total_pnl for s in stopped_snipers)
+    total_trades = sum(s.total_trades for s in stopped_snipers)
+    total = total_wins + total_losses
+    wr = (total_wins / total * 100) if total > 0 else 0
+    sign = "+" if total_pnl >= 0 else ""
+
+    for s in stopped_snipers:
+        sw = "+" if s.total_pnl >= 0 else ""
+        text += f"• {s.market_type}: {s.wins}W/{s.losses}L | {sw}${s.total_pnl:.2f}\n"
+
+    text += f"\n📈 Total: {total_trades} trades\n🏆 {total_wins}W / {total_losses}L ({wr:.0f}%)\n💰 P&L: {sign}${total_pnl:.2f}"
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 @owner_only
 async def snipe_auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start auto-sniper: /snipe_auto"""
-    from sniper import get_auto_sniper
+    from sniper import get_all_auto_snipers
 
-    if get_auto_sniper():
-        await update.message.reply_text("🤖 Auto-sniper вже запущений. /snipe_stop щоб зупинити.")
-        return
+    existing = get_all_auto_snipers()
+    types = [s.market_type for s in existing]
 
     uid = update.effective_user.id
-    _snipe_setup[uid] = {"mode": "auto", "step": "pick_type"}
+    _snipe_setup[uid] = {"mode": "auto", "step": "pick_type", "existing_types": types}
 
     buttons = [
         [InlineKeyboardButton("⚡ 15 min", callback_data="snipe_type:15m"),
@@ -1184,6 +1187,12 @@ async def snipe_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     # ── Auto: pick market type ─────────────────────────────
     if data.startswith("snipe_type:"):
         mtype = data.split(":")[1]
+        existing = setup.get("existing_types", [])
+        if mtype in existing:
+            # Replace existing sniper of same type
+            from sniper import stop_auto_sniper
+            stop_auto_sniper(mtype)
+
         setup["market_type"] = mtype
         setup["step"] = "auto_price"
 
