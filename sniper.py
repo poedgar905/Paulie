@@ -57,38 +57,49 @@ def _log_decision_sync(auto, decision: dict):
         except Exception:
             first_cell = None
 
-        if not first_cell:
+        needs_setup = not first_cell
+        if not needs_setup:
+            try:
+                p2 = ws.acell("P2").value
+                if p2 and str(p2).startswith("="):
+                    needs_setup = True
+            except Exception:
+                pass
+
+        if needs_setup:
+            try:
+                ws.batch_clear(["P1:Q13"])
+            except Exception:
+                pass
             headers = [
                 "Timestamp", "Market", "Type", "Time Left (s)",
                 "BTC Open", "BTC Now", "BTC Δ ($)", "BTC Δ (%)",
                 "Direction", "Mid (¢)", "Entry (¢)",
-                "Last 1m ($)", "Vol Ratio", "Trades Ratio", "Range Ratio", "Buy Ratio",
-                "Action", "Reason",
+                "Last 1m ($)", "Action", "Reason",
             ]
-            ws.update("A1:R1", [headers])
+            ws.update("A1:N1", [headers], value_input_option="USER_ENTERED")
 
-            # Stats formulas in column P
+            # Stats formulas
             summary = [
                 ["DECISION STATS", ""],
                 ["Total checks", '=COUNTA(A2:A)'],
-                ["ENTER", '=COUNTIF(Q2:Q,"ENTER")'],
-                ["SKIP (low move)", '=COUNTIF(R2:R,"BTC move*")'],
-                ["SKIP (reversal)", '=COUNTIF(R2:R,"Trend reversal*")'],
-                ["SKIP (too expensive)", '=COUNTIF(R2:R,"*too expensive*")'],
-                ["SKIP (spike)", '=COUNTIF(R2:R,"*Spike*")'],
-                ["FAIL (order)", '=COUNTIF(Q2:Q,"FAIL")'],
-                ["Entry rate %", '=IF(T3>0, T4/T3*100, 0)'],
+                ["ENTER", '=COUNTIF(M2:M,"ENTER")'],
+                ["SKIP (low move)", '=COUNTIF(N2:N,"BTC move*")'],
+                ["SKIP (reversal)", '=COUNTIF(N2:N,"Trend reversal*")'],
+                ["SKIP (too expensive)", '=COUNTIF(N2:N,"*too expensive*")'],
+                ["SKIP (mid too low)", '=COUNTIF(N2:N,"*too low*")'],
+                ["FAIL (order)", '=COUNTIF(M2:M,"FAIL")'],
+                ["Entry rate %", '=IF(P3>0, P4/P3*100, 0)'],
                 ["", ""],
-                ["AVG BTC Δ% on ENTER", '=AVERAGEIF(Q2:Q,"ENTER",H2:H)'],
-                ["AVG BTC Δ% on SKIP", '=AVERAGEIF(Q2:Q,"SKIP",H2:H)'],
-                ["AVG Vol Ratio on ENTER", '=AVERAGEIF(Q2:Q,"ENTER",M2:M)'],
-                ["AVG Vol Ratio on SKIP", '=AVERAGEIF(Q2:Q,"SKIP",M2:M)'],
+                ["AVG BTC Δ% on ENTER", '=AVERAGEIF(M2:M,"ENTER",H2:H)'],
+                ["AVG BTC Δ% on SKIP", '=AVERAGEIF(M2:M,"SKIP",H2:H)'],
+                ["AVG Mid on ENTER", '=AVERAGEIF(M2:M,"ENTER",J2:J)'],
             ]
-            ws.update("T1:U14", summary)
+            ws.update("P1:Q13", summary, value_input_option="USER_ENTERED")
 
             try:
-                ws.format("A1:R1", {"textFormat": {"bold": True}})
-                ws.format("T1:U1", {"textFormat": {"bold": True}})
+                ws.format("A1:N1", {"textFormat": {"bold": True}})
+                ws.format("P1:Q1", {"textFormat": {"bold": True}})
             except Exception:
                 pass
 
@@ -105,10 +116,6 @@ def _log_decision_sync(auto, decision: dict):
             decision.get("mid", ""),
             round(decision.get("entry_price", 0) * 100, 1),
             decision.get("last_1m_move", ""),
-            decision.get("vol_ratio", ""),
-            decision.get("trades_ratio", ""),
-            decision.get("range_ratio", ""),
-            decision.get("buy_ratio", ""),
             decision.get("action", ""),
             decision.get("reason", ""),
         ]
@@ -594,38 +601,58 @@ def stop_all() -> tuple[list[SnipeSession], "AutoSniper | None"]:
 # ── Background checker ───────────────────────────────────────
 
 def _save_config():
-    """Save sniper configs to JSON for persistence across restarts."""
-    import json
-    configs = []
-    for s in _auto_snipers.values():
-        if s.active:
-            configs.append({
-                "market_type": s.market_type,
-                "entry_price": s.entry_price,
-                "size_usdc": s.size_usdc,
-                "stop_loss_cents": s.stop_loss_cents,
-                "enter_before_sec": s.enter_before_sec,
-                "min_btc_move_pct": s.min_btc_move_pct,
-                "wins": s.wins,
-                "losses": s.losses,
-                "total_pnl": round(s.total_pnl, 4),
-                "total_trades": s.total_trades,
-            })
+    """Save sniper configs to tracker.db for persistence across restarts."""
+    import sqlite3
+    from config import DB_PATH
     try:
-        with open(_SAVE_PATH, "w") as f:
-            json.dump(configs, f)
+        import json
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS sniper_config (
+            market_type TEXT PRIMARY KEY,
+            config TEXT NOT NULL
+        )""")
+        # Clear old configs
+        c.execute("DELETE FROM sniper_config")
+        for s in _auto_snipers.values():
+            if s.active:
+                cfg = json.dumps({
+                    "market_type": s.market_type,
+                    "entry_price": s.entry_price,
+                    "size_usdc": s.size_usdc,
+                    "stop_loss_cents": s.stop_loss_cents,
+                    "enter_before_sec": s.enter_before_sec,
+                    "min_btc_move_pct": s.min_btc_move_pct,
+                    "wins": s.wins,
+                    "losses": s.losses,
+                    "total_pnl": round(s.total_pnl, 4),
+                    "total_trades": s.total_trades,
+                })
+                c.execute("INSERT OR REPLACE INTO sniper_config (market_type, config) VALUES (?, ?)",
+                          (s.market_type, cfg))
+        conn.commit()
+        conn.close()
     except Exception as e:
         logger.error("Save config error: %s", e)
 
 
 def load_saved_snipers() -> int:
-    """Load saved sniper configs on startup. Returns count loaded."""
-    import json
+    """Load saved sniper configs from tracker.db on startup."""
+    import sqlite3, json
+    from config import DB_PATH
     try:
-        with open(_SAVE_PATH, "r") as f:
-            configs = json.load(f)
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS sniper_config (
+            market_type TEXT PRIMARY KEY,
+            config TEXT NOT NULL
+        )""")
+        rows = c.execute("SELECT config FROM sniper_config").fetchall()
+        conn.close()
+
         count = 0
-        for cfg in configs:
+        for (cfg_json,) in rows:
+            cfg = json.loads(cfg_json)
             s = AutoSniper(
                 active=True,
                 market_type=cfg["market_type"],
@@ -645,8 +672,6 @@ def load_saved_snipers() -> int:
             logger.info("Restored sniper: %s %.0f¢ $%.0f",
                         cfg["market_type"], cfg["entry_price"]*100, cfg["size_usdc"])
         return count
-    except FileNotFoundError:
-        return 0
     except Exception as e:
         logger.error("Load config error: %s", e)
         return 0
@@ -1222,13 +1247,28 @@ def log_trade_to_sheets(
 
         ws = _get_or_create_sheet(spreadsheet, "🎯 Sniper")
 
-        # Check if headers exist
+        # Check if headers exist and are correct
         try:
             first_cell = ws.acell("A1").value
         except Exception:
             first_cell = None
 
-        if not first_cell:
+        # Force recreate if headers missing or stats show as text formulas
+        needs_setup = not first_cell
+        if not needs_setup:
+            try:
+                r2 = ws.acell("R2").value
+                if r2 and str(r2).startswith("="):
+                    needs_setup = True  # Formulas stored as text, need to redo
+            except Exception:
+                pass
+
+        if needs_setup:
+            # Clear stats area first
+            try:
+                ws.batch_clear(["R1:S36"])
+            except Exception:
+                pass
             headers = [
                 "Timestamp", "Market", "Type", "Direction",
                 "Entry (¢)", "Size ($)", "Shares",
@@ -1236,7 +1276,7 @@ def log_trade_to_sheets(
                 "BTC Open", "BTC Close", "BTC Δ",
                 "Enter Before (s)", "BTC Trigger (%)", "SL (¢)", "Time Left (s)",
             ]
-            ws.update("A1:P1", [headers])
+            ws.update("A1:P1", [headers], value_input_option="USER_ENTERED")
 
             # Summary formulas in column R
             summary = [
@@ -1277,7 +1317,7 @@ def log_trade_to_sheets(
                 ["0.05% WR%", '=IF(COUNTIF(N2:N,0.05)>0, COUNTIFS(N2:N,0.05,H2:H,"WIN")/COUNTIFS(N2:N,0.05,H2:H,"<>NO-FILL")*100, 0)'],
                 ["0.10% WR%", '=IF(COUNTIF(N2:N,0.1)>0, COUNTIFS(N2:N,0.1,H2:H,"WIN")/COUNTIFS(N2:N,0.1,H2:H,"<>NO-FILL")*100, 0)'],
             ]
-            ws.update("R1:S36", summary)
+            ws.update("R1:S36", summary, value_input_option="USER_ENTERED")
 
             try:
                 ws.format("A1:P1", {"textFormat": {"bold": True}})
