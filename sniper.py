@@ -40,6 +40,127 @@ async def _notify(bot, text: str):
             logger.debug("Notify error %s: %s", chat_id, e)
 
 
+def _log_decision_sync(auto, decision: dict):
+    """Log decision to Google Sheets '📋 Decisions' tab (sync)."""
+    try:
+        from sheets import _get_client, _get_or_create_sheet
+
+        gc, spreadsheet = _get_client()
+        if not gc or not spreadsheet:
+            return
+
+        ws = _get_or_create_sheet(spreadsheet, "📋 Decisions")
+
+        try:
+            first_cell = ws.acell("A1").value
+        except Exception:
+            first_cell = None
+
+        if not first_cell:
+            headers = [
+                "Timestamp", "Market", "Type", "Time Left (s)",
+                "BTC Open", "BTC Now", "BTC Δ ($)", "BTC Δ (%)",
+                "Direction", "Mid (¢)", "Entry (¢)",
+                "Last 1m ($)", "Action", "Reason",
+            ]
+            ws.update("A1:N1", [headers])
+
+            # Stats formulas in column P
+            summary = [
+                ["DECISION STATS", ""],
+                ["Total checks", '=COUNTA(A2:A)'],
+                ["ENTER", '=COUNTIF(M2:M,"ENTER")'],
+                ["SKIP (low move)", '=COUNTIF(N2:N,"BTC move*")'],
+                ["SKIP (reversal)", '=COUNTIF(N2:N,"Trend reversal*")'],
+                ["SKIP (too expensive)", '=COUNTIF(N2:N,"*too expensive*")'],
+                ["SKIP (mid too low)", '=COUNTIF(N2:N,"*too low*")'],
+                ["FAIL (order)", '=COUNTIF(M2:M,"FAIL")'],
+                ["Entry rate %", '=IF(P3>0, P4/P3*100, 0)'],
+                ["", ""],
+                ["AVG BTC Δ% on ENTER", '=AVERAGEIF(M2:M,"ENTER",H2:H)'],
+                ["AVG BTC Δ% on SKIP", '=AVERAGEIF(M2:M,"SKIP",H2:H)'],
+                ["AVG Mid on ENTER", '=AVERAGEIF(M2:M,"ENTER",J2:J)'],
+            ]
+            ws.update("P1:Q13", summary)
+
+            try:
+                ws.format("A1:N1", {"textFormat": {"bold": True}})
+                ws.format("P1:Q1", {"textFormat": {"bold": True}})
+            except Exception:
+                pass
+
+        row = [
+            decision.get("timestamp", ""),
+            decision.get("market", ""),
+            decision.get("market_type", ""),
+            decision.get("time_left", ""),
+            round(decision.get("btc_open", 0), 2),
+            round(decision.get("btc_now", 0), 2),
+            round(decision.get("btc_change", 0), 2),
+            decision.get("btc_change_pct", 0),
+            decision.get("direction", ""),
+            decision.get("mid", ""),
+            round(decision.get("entry_price", 0) * 100, 1),
+            decision.get("last_1m_move", ""),
+            decision.get("action", ""),
+            decision.get("reason", ""),
+        ]
+        ws.append_row(row, value_input_option="USER_ENTERED")
+
+    except Exception as e:
+        logger.error("Decision sheet error: %s", e)
+
+
+async def _log_decision(bot, auto, decision: dict):
+    """Log decision to Telegram + Sheets."""
+    action = decision.get("action", "?")
+    reason = decision.get("reason", "")
+    direction = decision.get("direction", "?")
+    btc_change = decision.get("btc_change", 0)
+    btc_change_pct = decision.get("btc_change_pct", 0)
+    btc_open = decision.get("btc_open", 0)
+    btc_now = decision.get("btc_now", 0)
+    mid = decision.get("mid", 0)
+    time_left = decision.get("time_left", 0)
+    market = decision.get("market", "?")[:50]
+    last_1m = decision.get("last_1m_move", 0)
+
+    if action == "ENTER":
+        # ENTER is logged separately in the main flow with more detail
+        pass
+    elif action == "SKIP":
+        emoji = "⏭"
+        try:
+            await _notify(bot,
+                f"{emoji} <b>SKIP</b> | {market}\n"
+                f"{'🟢' if direction == 'Up' else '🔴'} {direction} | "
+                f"BTC: ${btc_open:,.0f}→${btc_now:,.0f} ({'+' if btc_change>0 else ''}{btc_change:,.0f}, {btc_change_pct:.3f}%)\n"
+                f"{'📈 Mid: ' + str(mid) + '¢ | ' if mid else ''}"
+                f"{'Last 1m: ' + str(round(last_1m)) + ' | ' if last_1m else ''}"
+                f"⏱ {time_left}s left\n"
+                f"❌ {reason}"
+            )
+        except Exception:
+            pass
+    elif action == "FAIL":
+        try:
+            await _notify(bot,
+                f"⚠️ <b>FAIL</b> | {market}\n"
+                f"{'🟢' if direction == 'Up' else '🔴'} {direction} | "
+                f"BTC: {'+' if btc_change>0 else ''}{btc_change:,.0f} ({btc_change_pct:.3f}%)\n"
+                f"❌ {reason}"
+            )
+        except Exception:
+            pass
+
+    # Log to sheets in background
+    try:
+        import threading
+        threading.Thread(target=_log_decision_sync, args=(auto, decision), daemon=True).start()
+    except Exception:
+        pass
+
+
 @dataclass
 class SnipeSession:
     """One active sniper on a specific market."""
@@ -495,6 +616,8 @@ async def _run_auto_sniper(bot):
         auto.current_slug = slug
         auto.current_cid = ""
         auto.current_entered = False
+        if hasattr(auto, '_skipped'):
+            auto._skipped.clear()
 
     if auto.current_entered:
         return
@@ -503,7 +626,14 @@ async def _run_auto_sniper(bot):
     if time_left > auto.enter_before_sec:
         return
 
-    # ── DECISION TIME ─────────────────────────────────────
+    # ── DECISION TIME — LOG EVERYTHING ────────────────────
+
+    decision_log = {}  # Will be logged to sheets
+    decision_log["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    decision_log["market"] = live["question"][:60]
+    decision_log["market_type"] = auto.market_type
+    decision_log["time_left"] = time_left
+    decision_log["entry_price"] = auto.entry_price
 
     # BTC current price
     btc_now = get_btc_price()
@@ -520,19 +650,27 @@ async def _run_auto_sniper(bot):
     btc_change = btc_now - btc_open
     btc_change_pct = abs(btc_change / btc_open) * 100
 
+    decision_log["btc_open"] = btc_open
+    decision_log["btc_now"] = btc_now
+    decision_log["btc_change"] = btc_change
+    decision_log["btc_change_pct"] = round(btc_change_pct, 4)
+    decision_log["direction"] = "Up" if btc_change > 0 else "Down"
+
     # Not enough move?
     if btc_change_pct < auto.min_btc_move_pct:
+        # Only log this SKIP once per market (avoid spam every 3s)
+        skip_key = f"lowmove_{slug}"
+        if not hasattr(auto, '_skipped') or not isinstance(auto._skipped, set):
+            auto._skipped = set()
+        if skip_key not in auto._skipped:
+            auto._skipped.add(skip_key)
+            decision_log["action"] = "SKIP"
+            decision_log["reason"] = f"BTC move {btc_change_pct:.3f}% < trigger {auto.min_btc_move_pct:.2f}%"
+            await _log_decision(bot, auto, decision_log)
         return
 
     # ── TREND CONFIRMATION ────────────────────────────────
-    # Check last 1-min candle to see if BTC is STILL moving in same direction
-    # or if it's bouncing back (spike & reversal trap)
-    kline_1m = get_btc_kline("1m", 2)  # Get last 2 one-minute candles
-    if kline_1m:
-        # kline_1m returns only the latest; get 2 candles for comparison
-        pass
-
-    # Better approach: get last 3 one-minute klines
+    recent_move = 0
     try:
         import requests as _req
         resp = _req.get(
@@ -543,29 +681,22 @@ async def _run_auto_sniper(bot):
         if resp.status_code == 200:
             candles = resp.json()
             if len(candles) >= 2:
-                # Previous 1m candle close
                 prev_close = float(candles[-2][4])
-                # Current price vs previous close
                 recent_move = btc_now - prev_close
+                decision_log["last_1m_move"] = round(recent_move, 2)
 
-                if btc_change > 0:
-                    # We think UP — but is BTC still going up?
-                    if recent_move < 0:
-                        # BTC was up overall but DROPPED in last minute = reversal
-                        logger.info("Skip UP: BTC reversing (last 1m: %+.0f)", recent_move)
-                        return
-                else:
-                    # We think DOWN — but is BTC still going down?
-                    if recent_move > 0:
-                        # BTC was down overall but ROSE in last minute = reversal
-                        logger.info("Skip DOWN: BTC reversing (last 1m: %+.0f)", recent_move)
-                        return
-
-                logger.info("Trend confirmed: overall %+.0f, last 1m %+.0f",
-                            btc_change, recent_move)
+                if btc_change > 0 and recent_move < 0:
+                    decision_log["action"] = "SKIP"
+                    decision_log["reason"] = f"Trend reversal: overall UP but last 1m {recent_move:+.0f}"
+                    await _log_decision(bot, auto, decision_log)
+                    return
+                elif btc_change < 0 and recent_move > 0:
+                    decision_log["action"] = "SKIP"
+                    decision_log["reason"] = f"Trend reversal: overall DOWN but last 1m {recent_move:+.0f}"
+                    await _log_decision(bot, auto, decision_log)
+                    return
     except Exception as e:
         logger.debug("Trend check error: %s", e)
-        # Continue anyway if trend check fails
 
     # Direction
     if btc_change > 0:
@@ -576,44 +707,45 @@ async def _run_auto_sniper(bot):
         token_id = live["token_no"]
 
     if not token_id:
-        logger.warning("No token_id for direction %s", direction)
+        decision_log["action"] = "SKIP"
+        decision_log["reason"] = "No token_id"
+        await _log_decision(bot, auto, decision_log)
         return
 
     cid = live["condition_id"]
     title = live["question"]
 
     # ── MOMENTUM CHECK ────────────────────────────────────
-    # Only enter if Polymarket mid price is BELOW our entry price
-    # This means price is still rising towards our limit (momentum up)
-    # If mid > entry_price → price already above, we'd be buying on the way down
     mid = fetch_midprice(token_id)
+    decision_log["mid"] = round(mid * 100, 1) if mid else 0
+
     if mid:
         if mid > auto.entry_price:
-            # Price already above our entry — skip, would fill immediately
-            # on a potentially falling market
-            logger.info("Skip: mid %.0f¢ > entry %.0f¢ (no momentum edge)",
-                        mid * 100, auto.entry_price * 100)
+            decision_log["action"] = "SKIP"
+            decision_log["reason"] = f"Mid {mid*100:.0f}¢ > entry {auto.entry_price*100:.0f}¢ (too expensive)"
             auto.current_entered = True
+            await _log_decision(bot, auto, decision_log)
             return
 
         if mid < auto.entry_price * 0.5:
-            # Price way too low — direction not clear despite BTC move
-            logger.info("Skip: mid %.0f¢ too far from entry %.0f¢",
-                        mid * 100, auto.entry_price * 100)
+            decision_log["action"] = "SKIP"
+            decision_log["reason"] = f"Mid {mid*100:.0f}¢ too low (direction unclear)"
+            await _log_decision(bot, auto, decision_log)
             return
 
     # ── PLACE ORDER ───────────────────────────────────────
-    neg_risk = False
-    try:
-        from trading import get_neg_risk
-        neg_risk = get_neg_risk(cid)
-    except Exception:
-        pass
-
     result = place_limit_buy(token_id, auto.entry_price, auto.size_usdc, cid)
     if not result or not result.get("order_id"):
+        decision_log["action"] = "FAIL"
+        decision_log["reason"] = "Order placement failed"
+        await _log_decision(bot, auto, decision_log)
         logger.error("Failed to place order for %s", slug)
         return
+
+    # SUCCESS — order placed
+    decision_log["action"] = "ENTER"
+    decision_log["reason"] = "All checks passed"
+    await _log_decision(bot, auto, decision_log)
 
     auto.current_entered = True
     auto.current_cid = cid
