@@ -62,31 +62,33 @@ def _log_decision_sync(auto, decision: dict):
                 "Timestamp", "Market", "Type", "Time Left (s)",
                 "BTC Open", "BTC Now", "BTC Δ ($)", "BTC Δ (%)",
                 "Direction", "Mid (¢)", "Entry (¢)",
-                "Last 1m ($)", "Action", "Reason",
+                "Last 1m ($)", "Vol Ratio", "Trades Ratio", "Range Ratio", "Buy Ratio",
+                "Action", "Reason",
             ]
-            ws.update("A1:N1", [headers])
+            ws.update("A1:R1", [headers])
 
             # Stats formulas in column P
             summary = [
                 ["DECISION STATS", ""],
                 ["Total checks", '=COUNTA(A2:A)'],
-                ["ENTER", '=COUNTIF(M2:M,"ENTER")'],
-                ["SKIP (low move)", '=COUNTIF(N2:N,"BTC move*")'],
-                ["SKIP (reversal)", '=COUNTIF(N2:N,"Trend reversal*")'],
-                ["SKIP (too expensive)", '=COUNTIF(N2:N,"*too expensive*")'],
-                ["SKIP (mid too low)", '=COUNTIF(N2:N,"*too low*")'],
-                ["FAIL (order)", '=COUNTIF(M2:M,"FAIL")'],
-                ["Entry rate %", '=IF(P3>0, P4/P3*100, 0)'],
+                ["ENTER", '=COUNTIF(Q2:Q,"ENTER")'],
+                ["SKIP (low move)", '=COUNTIF(R2:R,"BTC move*")'],
+                ["SKIP (reversal)", '=COUNTIF(R2:R,"Trend reversal*")'],
+                ["SKIP (too expensive)", '=COUNTIF(R2:R,"*too expensive*")'],
+                ["SKIP (spike)", '=COUNTIF(R2:R,"*Spike*")'],
+                ["FAIL (order)", '=COUNTIF(Q2:Q,"FAIL")'],
+                ["Entry rate %", '=IF(T3>0, T4/T3*100, 0)'],
                 ["", ""],
-                ["AVG BTC Δ% on ENTER", '=AVERAGEIF(M2:M,"ENTER",H2:H)'],
-                ["AVG BTC Δ% on SKIP", '=AVERAGEIF(M2:M,"SKIP",H2:H)'],
-                ["AVG Mid on ENTER", '=AVERAGEIF(M2:M,"ENTER",J2:J)'],
+                ["AVG BTC Δ% on ENTER", '=AVERAGEIF(Q2:Q,"ENTER",H2:H)'],
+                ["AVG BTC Δ% on SKIP", '=AVERAGEIF(Q2:Q,"SKIP",H2:H)'],
+                ["AVG Vol Ratio on ENTER", '=AVERAGEIF(Q2:Q,"ENTER",M2:M)'],
+                ["AVG Vol Ratio on SKIP", '=AVERAGEIF(Q2:Q,"SKIP",M2:M)'],
             ]
-            ws.update("P1:Q13", summary)
+            ws.update("T1:U14", summary)
 
             try:
-                ws.format("A1:N1", {"textFormat": {"bold": True}})
-                ws.format("P1:Q1", {"textFormat": {"bold": True}})
+                ws.format("A1:R1", {"textFormat": {"bold": True}})
+                ws.format("T1:U1", {"textFormat": {"bold": True}})
             except Exception:
                 pass
 
@@ -103,6 +105,10 @@ def _log_decision_sync(auto, decision: dict):
             decision.get("mid", ""),
             round(decision.get("entry_price", 0) * 100, 1),
             decision.get("last_1m_move", ""),
+            decision.get("vol_ratio", ""),
+            decision.get("trades_ratio", ""),
+            decision.get("range_ratio", ""),
+            decision.get("buy_ratio", ""),
             decision.get("action", ""),
             decision.get("reason", ""),
         ]
@@ -801,6 +807,83 @@ async def _run_auto_sniper(bot, auto: AutoSniper):
                     return
     except Exception as e:
         logger.debug("Trend check error: %s", e)
+
+    # ── SPIKE / MANIPULATION DETECTION ────────────────────
+    # Check last 5 one-minute candles for anomalies:
+    # 1. Volume spike: last candle volume > 3x average of previous
+    # 2. Trade count spike: same for number of trades
+    # 3. Volatility spike: high-low range of last candle > 3x average
+    spike_detected = False
+    spike_reason = ""
+    try:
+        import requests as _req2
+        resp2 = _req2.get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": "BTCUSDT", "interval": "1m", "limit": 6},
+            timeout=5,
+        )
+        if resp2.status_code == 200:
+            candles2 = resp2.json()
+            if len(candles2) >= 5:
+                # Parse candles: [open_time, open, high, low, close, volume, close_time,
+                #                  quote_vol, num_trades, taker_buy_vol, taker_buy_quote_vol, ...]
+                prev_candles = candles2[:-1]  # All except last
+                last_candle = candles2[-1]
+
+                # Volume analysis
+                prev_volumes = [float(c[5]) for c in prev_candles]
+                last_volume = float(last_candle[5])
+                avg_volume = sum(prev_volumes) / len(prev_volumes) if prev_volumes else 1
+
+                # Trade count analysis
+                prev_trades = [int(c[8]) for c in prev_candles]
+                last_trades = int(last_candle[8])
+                avg_trades = sum(prev_trades) / len(prev_trades) if prev_trades else 1
+
+                # Volatility analysis (high - low range)
+                prev_ranges = [float(c[2]) - float(c[3]) for c in prev_candles]
+                last_range = float(last_candle[2]) - float(last_candle[3])
+                avg_range = sum(prev_ranges) / len(prev_ranges) if prev_ranges else 1
+
+                # Taker buy ratio (how much of volume is aggressive buying)
+                taker_buy_vol = float(last_candle[9])
+                taker_sell_vol = last_volume - taker_buy_vol
+                buy_ratio = taker_buy_vol / last_volume if last_volume > 0 else 0.5
+
+                decision_log["vol_ratio"] = round(last_volume / avg_volume, 1) if avg_volume > 0 else 0
+                decision_log["trades_ratio"] = round(last_trades / avg_trades, 1) if avg_trades > 0 else 0
+                decision_log["range_ratio"] = round(last_range / avg_range, 1) if avg_range > 0 else 0
+                decision_log["buy_ratio"] = round(buy_ratio, 2)
+
+                # Spike detection thresholds
+                vol_spike = last_volume > avg_volume * 3
+                trades_spike = last_trades > avg_trades * 3
+                range_spike = last_range > avg_range * 4
+
+                if vol_spike and range_spike:
+                    spike_detected = True
+                    spike_reason = f"Volume {last_volume/avg_volume:.1f}x + Range {last_range/avg_range:.1f}x normal"
+                elif trades_spike and range_spike:
+                    spike_detected = True
+                    spike_reason = f"Trades {last_trades/avg_trades:.1f}x + Range {last_range/avg_range:.1f}x normal"
+
+                # Also check: if BTC going down but buy ratio high = reversal incoming
+                if btc_change < 0 and buy_ratio > 0.7:
+                    spike_detected = True
+                    spike_reason = f"BTC down but buy ratio {buy_ratio:.0%} (whales buying dip)"
+                elif btc_change > 0 and buy_ratio < 0.3:
+                    spike_detected = True
+                    spike_reason = f"BTC up but buy ratio {buy_ratio:.0%} (whales selling top)"
+
+    except Exception as e:
+        logger.debug("Spike check error: %s", e)
+
+    if spike_detected:
+        decision_log["action"] = "SKIP"
+        decision_log["reason"] = f"🚨 Spike: {spike_reason}"
+        await _log_decision(bot, auto, decision_log)
+        auto.current_entered = True  # Skip this market
+        return
 
     # Direction
     if btc_change > 0:
