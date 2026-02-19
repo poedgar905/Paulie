@@ -922,6 +922,9 @@ async def post_init(app: Application):
         BotCommand("snipe_auto", "🤖 Авто-снайпер"),
         BotCommand("snipe_status", "📊 Статус снайперів"),
         BotCommand("snipe_stop", "🛑 Зупинити снайперів"),
+        BotCommand("weather", "🌤 Weather sniper"),
+        BotCommand("weather_status", "📊 Статус weather"),
+        BotCommand("weather_stop", "🛑 Зупинити weather"),
     ])
 
     # Start poller
@@ -949,6 +952,11 @@ async def post_init(app: Application):
     from sniper import sniper_checker
     asyncio.create_task(sniper_checker(app.bot))
     logger.info("Sniper checker started")
+
+    # Start weather checker
+    from weather_sniper import weather_checker
+    asyncio.create_task(weather_checker(app.bot))
+    logger.info("Weather checker started")
 
     trading = "✅" if is_trading_enabled() else "❌ (no key)"
     try:
@@ -1516,6 +1524,101 @@ async def snipe_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text("❌ Не вдалось розмістити ордер. Перевір баланс.")
 
 
+# ── Weather Sniper Commands ──────────────────────────────────
+
+@owner_only
+async def weather_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start weather sniper: /weather <polymarket_url> [max_price_cents] [size_usd]"""
+    from weather_sniper import start_weather_sniper, parse_polymarket_url
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "🌤 <b>Weather Sniper</b>\n\n"
+            "Використання:\n"
+            "<code>/weather URL [ціна] [розмір] [годин_до]</code>\n\n"
+            "Приклад:\n"
+            "<code>/weather https://polymarket.com/event/highest-temperature-in-london-on-february-20 65 2 10</code>\n\n"
+            "• Ціна — макс лімітка (за замовч. 65¢)\n"
+            "• Розмір — $ на outcome (за замовч. $2)\n"
+            "• Годин до — за скільки годин входити (за замовч. 10)",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    url = args[0]
+    max_price = int(args[1]) / 100 if len(args) > 1 else 0.65
+    size = float(args[2]) if len(args) > 2 else 2.0
+    hours_before = float(args[3]) if len(args) > 3 else 10
+
+    parsed = parse_polymarket_url(url)
+    if not parsed:
+        await update.message.reply_text("❌ Невірна силка Polymarket.")
+        return
+
+    await update.message.reply_text("🔍 Завантажую ринок...")
+
+    sniper = start_weather_sniper(url, max_price, size, hours_before)
+    if not sniper:
+        await update.message.reply_text("❌ Не вдалось знайти ринок. Перевір силку.")
+        return
+
+    outcome_lines = []
+    for o in sniper.outcomes:
+        prob = f"{o.market_prob*100:.0f}%" if o.market_prob else "?"
+        outcome_lines.append(f"  • {o.outcome_name[:40]} — {prob}")
+
+    # Calculate hours left
+    now = int(time.time())
+    hours_left = (sniper.event_end_ts - now) / 3600 if sniper.event_end_ts > 0 else -1
+    
+    if hours_left > 0:
+        timing_text = f"⏱ Закриття через {hours_left:.1f}h | Вхід за {hours_before:.0f}h до кінця"
+    else:
+        timing_text = "⚠️ Не вдалось визначити час закриття"
+
+    await update.message.reply_text(
+        f"🌤 <b>Weather Sniper запущено!</b>\n\n"
+        f"📌 {sniper.event_title[:60]}\n"
+        f"💰 ${size:.0f}/outcome | Max: {max_price*100:.0f}¢\n"
+        f"{timing_text}\n"
+        f"📊 Outcomes ({len(sniper.outcomes)}):\n"
+        + "\n".join(outcome_lines)
+        + "\n\n⏳ Моніторю, ставлю лімітку на лідера коли прийде час...",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@owner_only
+async def weather_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show weather sniper status."""
+    from weather_sniper import format_weather_status
+    await update.message.reply_text(format_weather_status(), parse_mode=ParseMode.HTML)
+
+
+@owner_only
+async def weather_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop weather snipers."""
+    from weather_sniper import stop_all_weather, get_all_weather_snipers
+
+    args = context.args or []
+    if args:
+        # Stop specific by slug
+        from weather_sniper import stop_weather_sniper
+        s = stop_weather_sniper(args[0])
+        if s:
+            await update.message.reply_text(f"🛑 Stopped: {s.event_title[:50]}")
+        else:
+            await update.message.reply_text("❌ Не знайдено.")
+        return
+
+    stopped = stop_all_weather()
+    if not stopped:
+        await update.message.reply_text("🌤 Немає активних weather snipers.")
+        return
+    await update.message.reply_text(f"🛑 Зупинено {len(stopped)} weather sniper(s).")
+
+
 def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
@@ -1537,6 +1640,9 @@ def main():
     app.add_handler(CommandHandler("snipe_status", snipe_status_cmd))
     app.add_handler(CommandHandler("snipe_stop", snipe_stop_cmd))
     app.add_handler(CallbackQueryHandler(snipe_callback_handler, pattern=r"^snipe_"))
+    app.add_handler(CommandHandler("weather", weather_cmd))
+    app.add_handler(CommandHandler("weather_status", weather_status_cmd))
+    app.add_handler(CommandHandler("weather_stop", weather_stop_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_amount_handler))
 
