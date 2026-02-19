@@ -348,7 +348,7 @@ async def _check_weather_sniper(bot, sniper: WeatherSniper):
             if o.condition_id == m["condition_id"]:
                 o.market_prob = m["price"]
     
-    # ── Check timing — is it time to enter? ───────────────
+    # ── Check timing ────────────────────────────────────────
     now = int(time.time())
     
     if sniper.event_end_ts <= 0:
@@ -364,43 +364,56 @@ async def _check_weather_sniper(bot, sniper: WeatherSniper):
                 except Exception:
                     pass
     
-    if sniper.event_end_ts <= 0:
-        # No end time known — don't enter blindly
-        logger.debug("Weather %s: no end_ts, skipping", sniper.event_slug[:20])
-        return
-    
-    hours_left = (sniper.event_end_ts - now) / 3600
-    
-    if hours_left > sniper.enter_hours_before:
-        # Too early — just monitor
-        logger.debug("Weather %s: %.1fh left > %.0fh threshold, waiting...",
-                     sniper.event_slug[:20], hours_left, sniper.enter_hours_before)
-        return
+    hours_left = (sniper.event_end_ts - now) / 3600 if sniper.event_end_ts > 0 else 999
     
     if hours_left < 0:
-        # Event ended — check resolution
         await _check_weather_resolution(bot, sniper)
         return
     
-    # ── TIME TO ENTER! Find the leader ────────────────────
-    # Sort outcomes by probability (highest first)
+    # ── Find the leader ───────────────────────────────────
     ranked = sorted(sniper.outcomes, key=lambda o: o.market_prob, reverse=True)
     
     if not ranked:
         return
     
     leader = ranked[0]
-    
-    # Log decision
     outcome_info = ", ".join(f"{o.outcome_name[:15]}={o.market_prob*100:.0f}%" for o in ranked[:4])
     
-    # Check if leader is affordable
-    if leader.market_prob > sniper.max_price:
-        # Leader too expensive — notify once and wait
+    # ── ENTRY CONDITIONS ──────────────────────────────────
+    # Both must be true:
+    #   1. Leader probability >= 55% (confident enough)
+    #   2. Hours left <= enter_hours_before (default 15h)
+    # This catches the sweet spot: leader is clear but still cheap
+    
+    min_prob = 0.55  # leader must be at least 55%
+    
+    leader_ready = leader.market_prob >= min_prob
+    time_ready = hours_left <= sniper.enter_hours_before
+    affordable = leader.market_prob <= sniper.max_price
+    
+    if not time_ready:
+        # Too far from close — just monitor
+        return
+    
+    if not leader_ready:
+        # In time window but no clear leader yet — wait
+        if not hasattr(sniper, '_notified_waiting') or not sniper._notified_waiting:
+            sniper._notified_waiting = True
+            await _weather_notify(bot,
+                f"⏳ <b>MONITOR</b> | {sniper.event_title[:50]}\n"
+                f"🏆 Лідер: {leader.outcome_name} ({leader.market_prob*100:.0f}%)\n"
+                f"📊 Потрібно ≥55% для входу\n"
+                f"⏱ {hours_left:.1f}h до закриття\n"
+                f"📊 {outcome_info}"
+            )
+        return
+    
+    if not affordable:
+        # Leader is confident but already too expensive
         if not hasattr(sniper, '_notified_expensive') or not sniper._notified_expensive:
             sniper._notified_expensive = True
             await _weather_notify(bot,
-                f"⏳ <b>WAIT</b> | {sniper.event_title[:50]}\n"
+                f"💸 <b>TOO LATE</b> | {sniper.event_title[:50]}\n"
                 f"🏆 Лідер: {leader.outcome_name} ({leader.market_prob*100:.0f}%)\n"
                 f"💰 Ціна {leader.market_prob*100:.0f}¢ > max {sniper.max_price*100:.0f}¢\n"
                 f"⏱ {hours_left:.1f}h до закриття\n"
@@ -408,7 +421,7 @@ async def _check_weather_sniper(bot, sniper: WeatherSniper):
             )
         return
     
-    # Leader affordable — place order!
+    # ── SWEET SPOT! Leader >= 55%, affordable, in time window → ENTER!
     try:
         result = place_limit_buy(
             leader.token_id, sniper.max_price, sniper.size_usdc, leader.condition_id
@@ -422,7 +435,7 @@ async def _check_weather_sniper(bot, sniper: WeatherSniper):
             await _weather_notify(bot,
                 f"🎯 <b>ORDER!</b> {sniper.event_title[:50]}\n"
                 f"📌 {leader.outcome_name} @ {sniper.max_price*100:.0f}¢\n"
-                f"📊 Prob: {leader.market_prob*100:.0f}% (лідер)\n"
+                f"📊 Prob: {leader.market_prob*100:.0f}% (лідер ≥55%)\n"
                 f"💰 ${sniper.size_usdc:.2f}\n"
                 f"⏱ {hours_left:.1f}h до закриття\n"
                 f"📊 {outcome_info}"
@@ -692,11 +705,15 @@ def format_weather_status() -> str:
         elif s.orders_placed:
             timing = "🔵 Ордер розміщений — чекаємо fill"
         elif hours_left > s.enter_hours_before:
-            timing = f"⏳ Чекаємо ({hours_left:.1f}h left, enter at {s.enter_hours_before:.0f}h)"
-        elif hours_left > 0:
-            timing = f"🟡 Час входу! ({hours_left:.1f}h left)"
+            timing = f"⏳ Чекаємо ({hours_left:.1f}h left, window at ≤{s.enter_hours_before:.0f}h)"
         else:
-            timing = "⏰ Закривається"
+            # In window — check leader
+            ranked = sorted(s.outcomes, key=lambda o: o.market_prob, reverse=True)
+            leader_prob = ranked[0].market_prob * 100 if ranked else 0
+            if leader_prob >= 55:
+                timing = f"🟡 Готовий! Лідер {leader_prob:.0f}% ≥ 55% ({hours_left:.1f}h left)"
+            else:
+                timing = f"👀 Моніторю ({hours_left:.1f}h left, лідер {leader_prob:.0f}% < 55%)"
         
         outcome_lines = []
         for o in s.outcomes:
