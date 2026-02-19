@@ -763,6 +763,9 @@ async def _run_auto_sniper(bot, auto: AutoSniper):
 
     # ── DECISION TIME — LOG EVERYTHING ────────────────────
 
+    if not hasattr(auto, '_skipped') or not isinstance(auto._skipped, set):
+        auto._skipped = set()
+
     decision_log = {}  # Will be logged to sheets
     decision_log["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
     decision_log["market"] = live["question"][:60]
@@ -793,10 +796,8 @@ async def _run_auto_sniper(bot, auto: AutoSniper):
 
     # Not enough move?
     if btc_change_pct < auto.min_btc_move_pct:
-        # Only log this SKIP once per market (avoid spam every 3s)
+        # Only log this SKIP once per market (avoid spam every 1.5s)
         skip_key = f"lowmove_{slug}"
-        if not hasattr(auto, '_skipped') or not isinstance(auto._skipped, set):
-            auto._skipped = set()
         if skip_key not in auto._skipped:
             auto._skipped.add(skip_key)
             decision_log["action"] = "SKIP"
@@ -820,15 +821,28 @@ async def _run_auto_sniper(bot, auto: AutoSniper):
                 recent_move = btc_now - prev_close
                 decision_log["last_1m_move"] = round(recent_move, 2)
 
-                if btc_change > 0 and recent_move < 0:
-                    decision_log["action"] = "SKIP"
-                    decision_log["reason"] = f"Trend reversal: overall UP but last 1m {recent_move:+.0f}"
-                    await _log_decision(bot, auto, decision_log)
+                # Only consider it a reversal if last 1m move is:
+                # 1. Opposite direction to overall move
+                # 2. Significant: > 50% of overall move magnitude
+                # Example: overall -$47, last 1m +$15 = 32% retracement → NOT reversal
+                #          overall -$47, last 1m +$30 = 64% retracement → YES reversal
+                retracement_pct = abs(recent_move / btc_change) * 100 if btc_change != 0 else 0
+
+                if btc_change > 0 and recent_move < 0 and retracement_pct > 50:
+                    skip_key = f"reversal_{slug}"
+                    if skip_key not in auto._skipped:
+                        auto._skipped.add(skip_key)
+                        decision_log["action"] = "SKIP"
+                        decision_log["reason"] = f"Trend reversal: UP but last 1m {recent_move:+.0f} ({retracement_pct:.0f}% retrace)"
+                        await _log_decision(bot, auto, decision_log)
                     return
-                elif btc_change < 0 and recent_move > 0:
-                    decision_log["action"] = "SKIP"
-                    decision_log["reason"] = f"Trend reversal: overall DOWN but last 1m {recent_move:+.0f}"
-                    await _log_decision(bot, auto, decision_log)
+                elif btc_change < 0 and recent_move > 0 and retracement_pct > 50:
+                    skip_key = f"reversal_{slug}"
+                    if skip_key not in auto._skipped:
+                        auto._skipped.add(skip_key)
+                        decision_log["action"] = "SKIP"
+                        decision_log["reason"] = f"Trend reversal: DOWN but last 1m {recent_move:+.0f} ({retracement_pct:.0f}% retrace)"
+                        await _log_decision(bot, auto, decision_log)
                     return
     except Exception as e:
         logger.debug("Trend check error: %s", e)
@@ -904,9 +918,12 @@ async def _run_auto_sniper(bot, auto: AutoSniper):
         logger.debug("Spike check error: %s", e)
 
     if spike_detected:
-        decision_log["action"] = "SKIP"
-        decision_log["reason"] = f"🚨 Spike: {spike_reason}"
-        await _log_decision(bot, auto, decision_log)
+        skip_key = f"spike_{slug}"
+        if skip_key not in auto._skipped:
+            auto._skipped.add(skip_key)
+            decision_log["action"] = "SKIP"
+            decision_log["reason"] = f"🚨 Spike: {spike_reason}"
+            await _log_decision(bot, auto, decision_log)
         auto.current_entered = True  # Skip this market
         return
 
@@ -933,16 +950,22 @@ async def _run_auto_sniper(bot, auto: AutoSniper):
 
     if mid:
         if mid > auto.entry_price:
-            decision_log["action"] = "SKIP"
-            decision_log["reason"] = f"Mid {mid*100:.0f}¢ > entry {auto.entry_price*100:.0f}¢ (too expensive)"
+            skip_key = f"expensive_{slug}"
+            if skip_key not in auto._skipped:
+                auto._skipped.add(skip_key)
+                decision_log["action"] = "SKIP"
+                decision_log["reason"] = f"Mid {mid*100:.0f}¢ > entry {auto.entry_price*100:.0f}¢ (too expensive)"
+                await _log_decision(bot, auto, decision_log)
             auto.current_entered = True
-            await _log_decision(bot, auto, decision_log)
             return
 
         if mid < auto.entry_price * 0.5:
-            decision_log["action"] = "SKIP"
-            decision_log["reason"] = f"Mid {mid*100:.0f}¢ too low (direction unclear)"
-            await _log_decision(bot, auto, decision_log)
+            skip_key = f"midlow_{slug}"
+            if skip_key not in auto._skipped:
+                auto._skipped.add(skip_key)
+                decision_log["action"] = "SKIP"
+                decision_log["reason"] = f"Mid {mid*100:.0f}¢ too low (direction unclear)"
+                await _log_decision(bot, auto, decision_log)
             return
 
     # ── PLACE ORDER ───────────────────────────────────────
