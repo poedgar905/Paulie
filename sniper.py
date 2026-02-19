@@ -57,20 +57,7 @@ def _log_decision_sync(auto, decision: dict):
         except Exception:
             first_cell = None
 
-        needs_setup = not first_cell
-        if not needs_setup:
-            try:
-                p2 = ws.acell("P2").value
-                if p2 and str(p2).startswith("="):
-                    needs_setup = True
-            except Exception:
-                pass
-
-        if needs_setup:
-            try:
-                ws.batch_clear(["P1:Q13"])
-            except Exception:
-                pass
+        if not first_cell:
             headers = [
                 "Timestamp", "Market", "Type", "Time Left (s)",
                 "BTC Open", "BTC Now", "BTC Δ ($)", "BTC Δ (%)",
@@ -79,27 +66,27 @@ def _log_decision_sync(auto, decision: dict):
             ]
             ws.update("A1:N1", [headers], value_input_option="USER_ENTERED")
 
-            # Stats formulas
+            # Stats formulas — Action=M, Reason=N
             summary = [
                 ["DECISION STATS", ""],
                 ["Total checks", '=COUNTA(A2:A)'],
                 ["ENTER", '=COUNTIF(M2:M,"ENTER")'],
                 ["SKIP (low move)", '=COUNTIF(N2:N,"BTC move*")'],
-                ["SKIP (reversal)", '=COUNTIF(N2:N,"Trend reversal*")'],
+                ["SKIP (reversal)", '=COUNTIF(N2:N,"*reversal*")'],
                 ["SKIP (too expensive)", '=COUNTIF(N2:N,"*too expensive*")'],
-                ["SKIP (mid too low)", '=COUNTIF(N2:N,"*too low*")'],
+                ["SKIP (spike)", '=COUNTIF(N2:N,"*Spike*")'],
                 ["FAIL (order)", '=COUNTIF(M2:M,"FAIL")'],
-                ["Entry rate %", '=IF(P3>0, P4/P3*100, 0)'],
+                ["Entry rate %", '=IF(P3>0,P4/P3*100,0)'],
                 ["", ""],
-                ["AVG BTC Δ% on ENTER", '=AVERAGEIF(M2:M,"ENTER",H2:H)'],
-                ["AVG BTC Δ% on SKIP", '=AVERAGEIF(M2:M,"SKIP",H2:H)'],
-                ["AVG Mid on ENTER", '=AVERAGEIF(M2:M,"ENTER",J2:J)'],
+                ["AVG BTC Δ% ENTER", '=IFERROR(AVERAGEIF(M2:M,"ENTER",H2:H),0)'],
+                ["AVG BTC Δ% SKIP", '=IFERROR(AVERAGEIF(M2:M,"SKIP",H2:H),0)'],
+                ["AVG Mid ENTER", '=IFERROR(AVERAGEIF(M2:M,"ENTER",J2:J),0)'],
             ]
             ws.update("P1:Q13", summary, value_input_option="USER_ENTERED")
 
             try:
                 ws.format("A1:N1", {"textFormat": {"bold": True}})
-                ws.format("P1:Q1", {"textFormat": {"bold": True}})
+                ws.format("P1:P1", {"textFormat": {"bold": True}})
             except Exception:
                 pass
 
