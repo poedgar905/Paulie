@@ -893,13 +893,14 @@ async def _run_auto_sniper(bot, auto: AutoSniper):
                     spike_detected = True
                     spike_reason = f"Trades {last_trades/avg_trades:.1f}x + Range {last_range/avg_range:.1f}x normal"
 
-                # Also check: if BTC going down but buy ratio high = reversal incoming
-                if btc_change < 0 and buy_ratio > 0.7:
+                # Also check: extreme buy ratio ONLY when combined with volume spike
+                # Standalone buy ratio is too noisy on 1-min candles
+                if vol_spike and buy_ratio < 0.15:
                     spike_detected = True
-                    spike_reason = f"BTC down but buy ratio {buy_ratio:.0%} (whales buying dip)"
-                elif btc_change > 0 and buy_ratio < 0.3:
+                    spike_reason = f"Volume {last_volume/avg_volume:.1f}x + buy ratio {buy_ratio:.0%} (aggressive selling)"
+                elif vol_spike and buy_ratio > 0.85:
                     spike_detected = True
-                    spike_reason = f"BTC up but buy ratio {buy_ratio:.0%} (whales selling top)"
+                    spike_reason = f"Volume {last_volume/avg_volume:.1f}x + buy ratio {buy_ratio:.0%} (aggressive buying)"
 
     except Exception as e:
         logger.debug("Spike check error: %s", e)
