@@ -925,6 +925,7 @@ async def post_init(app: Application):
         BotCommand("weather", "🌤 Weather sniper"),
         BotCommand("weather_status", "📊 Статус weather"),
         BotCommand("weather_stop", "🛑 Зупинити weather"),
+        BotCommand("15min_bot", "🤖 Adaptive BTC Bot"),
     ])
 
     # Start poller
@@ -957,6 +958,11 @@ async def post_init(app: Application):
     from weather_sniper import weather_checker
     asyncio.create_task(weather_checker(app.bot))
     logger.info("Weather checker started")
+
+    # Start adaptive BTC bot
+    from btc_adaptive import adaptive_checker
+    asyncio.create_task(adaptive_checker(app.bot))
+    logger.info("Adaptive BTC bot checker started")
 
     trading = "✅" if is_trading_enabled() else "❌ (no key)"
     try:
@@ -1524,6 +1530,47 @@ async def snipe_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text("❌ Не вдалось розмістити ордер. Перевір баланс.")
 
 
+# ── Adaptive BTC Bot Commands ────────────────────────────────
+
+@owner_only
+async def adaptive_bot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/15min_bot [status|stop]"""
+    from btc_adaptive import start_adaptive, stop_adaptive, is_active, get_status
+
+    args = context.args or []
+    action = args[0].lower() if args else ""
+
+    if action == "status":
+        await update.message.reply_text(get_status(), parse_mode=ParseMode.HTML)
+        return
+
+    if action == "stop":
+        if not is_active():
+            await update.message.reply_text("🤖 Adaptive Bot вже вимкнений.")
+            return
+        stop_adaptive()
+        await update.message.reply_text("🛑 Adaptive BTC Bot зупинено.")
+        return
+
+    # Start
+    if is_active():
+        await update.message.reply_text(get_status(), parse_mode=ParseMode.HTML)
+        return
+
+    start_adaptive()
+    await update.message.reply_text(
+        "🤖 <b>Adaptive BTC Bot запущено!</b>\n\n"
+        "Бот сам аналізує кожен 15-хвилинний ринок і вибирає:\n"
+        "🟢 <b>CONFIDENT</b> — сильний тренд → 88¢, останні 45с\n"
+        "🟡 <b>MODERATE</b> — помірний тренд → 70¢, останні 90с\n"
+        "🔵 <b>EARLY</b> — ранній сигнал → 58¢, останні 150с\n\n"
+        "📊 Моніторю 24/7. Кожний трейд → Telegram + Google Sheets.\n\n"
+        "<code>/15min_bot status</code> — подивитись статистику\n"
+        "<code>/15min_bot stop</code> — зупинити",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 # ── Weather Sniper Commands ──────────────────────────────────
 
 @owner_only
@@ -1643,6 +1690,7 @@ def main():
     app.add_handler(CommandHandler("weather", weather_cmd))
     app.add_handler(CommandHandler("weather_status", weather_status_cmd))
     app.add_handler(CommandHandler("weather_stop", weather_stop_cmd))
+    app.add_handler(CommandHandler("15min_bot", adaptive_bot_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_amount_handler))
 
