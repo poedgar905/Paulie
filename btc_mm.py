@@ -255,7 +255,6 @@ async def _run_mm_cycle(bot):
     time_elapsed = 900 - time_left if _mm_config["market_type"] == "15m" else 300 - time_left
 
     # Only enter between minute 3-10 of 15m market (180s-600s elapsed)
-    # For 5m: between 60s-180s elapsed
     if _mm_config["market_type"] == "15m":
         if time_elapsed < 180 or time_elapsed > 600:
             return
@@ -263,10 +262,12 @@ async def _run_mm_cycle(bot):
         if time_elapsed < 60 or time_elapsed > 180:
             return
 
-    # Already traded this slug?
-    if hasattr(_run_mm_cycle, '_last_slug') and _run_mm_cycle._last_slug == slug:
+    # Already traded this slug? Use a set to track ALL traded slugs
+    if not hasattr(_run_mm_cycle, '_traded_slugs'):
+        _run_mm_cycle._traded_slugs = set()
+    if slug in _run_mm_cycle._traded_slugs:
         return
-    
+
     # ── Check conditions ──────────────────────────────
     cond = check_mm_conditions()
     if not cond.should_enter:
@@ -283,29 +284,56 @@ async def _run_mm_cycle(bot):
     if not (0.44 <= mid_yes <= 0.56 and 0.44 <= mid_no <= 0.56):
         return
 
+    # ── Mark slug as traded BEFORE placing orders ─────
+    _run_mm_cycle._traded_slugs.add(slug)
+    # Clean old slugs (keep last 20)
+    if len(_run_mm_cycle._traded_slugs) > 20:
+        _run_mm_cycle._traded_slugs = set(list(_run_mm_cycle._traded_slugs)[-10:])
+
     # ── ENTER! Buy both sides ─────────────────────────
     buy_price = _mm_config["buy_price"]
     size = _mm_config["size_usdc"]
     cid = live["condition_id"]
 
+    # Calculate shares: minimum 5 for neg_risk markets
+    import math
+    raw_shares = math.ceil(size * 1.05 / buy_price * 100) / 100
+    shares = max(raw_shares, 5.0)  # Polymarket min = 5 shares
+    actual_cost = round(shares * buy_price, 2)
+
     # Buy YES
-    res_yes = place_limit_buy(live["token_yes"], buy_price, size, cid)
+    res_yes = place_limit_buy(live["token_yes"], buy_price, actual_cost, cid)
     if not res_yes or not res_yes.get("order_id"):
+        await _mm_notify(bot,
+            f"⚠️ <b>MM FAIL</b> | YES buy failed\n"
+            f"📌 {live['question'][:50]}")
         return
 
-    # Small delay between orders
+    # Check if YES filled instantly (matched on placement)
+    yes_status = "live"
+    yes_resp = res_yes.get("response", {})
+    if yes_resp.get("status") == "matched":
+        yes_status = "matched"
+
     await asyncio.sleep(0.5)
 
     # Buy NO
-    res_no = place_limit_buy(live["token_no"], buy_price, size, cid)
+    res_no = place_limit_buy(live["token_no"], buy_price, actual_cost, cid)
     if not res_no or not res_no.get("order_id"):
-        # Cancel YES order
-        cancel_order(res_yes["order_id"])
+        # Cancel/sell YES
+        if yes_status == "matched":
+            place_market_sell(live["token_yes"], shares, cid)
+        else:
+            cancel_order(res_yes["order_id"])
+        await _mm_notify(bot,
+            f"⚠️ <b>MM FAIL</b> | NO buy failed, reversed YES\n"
+            f"📌 {live['question'][:50]}")
         return
 
-    import math
-    yes_shares = math.ceil(size * 1.05 / buy_price * 100) / 100
-    no_shares = math.ceil(size * 1.05 / buy_price * 100) / 100
+    no_status = "live"
+    no_resp = res_no.get("response", {})
+    if no_resp.get("status") == "matched":
+        no_status = "matched"
 
     _active_session = MMSession(
         slug=slug,
@@ -314,24 +342,28 @@ async def _run_mm_cycle(bot):
         market_end_ts=end_ts,
         yes_token=live["token_yes"],
         yes_buy_order=res_yes["order_id"],
-        yes_buy_status="live",
-        yes_shares=yes_shares,
+        yes_buy_status=yes_status,
+        yes_shares=shares,
         no_token=live["token_no"],
         no_buy_order=res_no["order_id"],
-        no_buy_status="live",
-        no_shares=no_shares,
+        no_buy_status=no_status,
+        no_shares=shares,
         phase="buying",
         entered_at=now,
         reason=cond.reason,
     )
-    _run_mm_cycle._last_slug = slug
+
+    # If both already matched, skip to selling phase
+    if yes_status == "matched" and no_status == "matched":
+        _active_session.phase = "selling"
 
     await _mm_notify(bot,
         f"🔄 <b>MM ENTER</b> | {live['question'][:50]}\n"
-        f"💰 YES 50¢ + NO 50¢ = ${size*2:.2f}\n"
+        f"💰 YES 50¢ + NO 50¢ ({shares} shares each)\n"
         f"📊 {cond.reason}\n"
-        f"🎯 Sell targets: 60¢ | Stop loss: 40¢\n"
-        f"⏱ {time_left}s left"
+        f"🎯 Sell: 60¢ | SL: 40¢\n"
+        f"⏱ {time_left}s left\n"
+        f"YES: {yes_status} | NO: {no_status}"
     )
     _save_mm_state()
 
@@ -399,6 +431,14 @@ async def _manage_session(bot):
             if res and res.get("order_id"):
                 s.yes_sell_order = res["order_id"]
                 s.yes_sell_status = "live"
+                logger.info("MM: YES sell placed @ %.0f¢", sell_price * 100)
+            else:
+                logger.error("MM: YES sell FAILED")
+                await _mm_notify(bot,
+                    f"⚠️ <b>MM SELL FAIL</b> | YES sell failed\n"
+                    f"📌 {s.title[:40]}")
+
+        await asyncio.sleep(0.5)
 
         # Place NO sell
         if not s.no_sell_order and not s.no_closed:
@@ -406,10 +446,22 @@ async def _manage_session(bot):
             if res and res.get("order_id"):
                 s.no_sell_order = res["order_id"]
                 s.no_sell_status = "live"
+                logger.info("MM: NO sell placed @ %.0f¢", sell_price * 100)
+            else:
+                logger.error("MM: NO sell FAILED")
+                await _mm_notify(bot,
+                    f"⚠️ <b>MM SELL FAIL</b> | NO sell failed\n"
+                    f"📌 {s.title[:40]}")
 
-        if (s.yes_sell_order or s.yes_closed) and (s.no_sell_order or s.no_closed):
-            s.phase = "monitoring"
-            _save_mm_state()
+        s.phase = "monitoring"
+        _save_mm_state()
+
+        sells_ok = bool(s.yes_sell_order) + bool(s.no_sell_order)
+        await _mm_notify(bot,
+            f"📊 <b>MM SELLING</b> | {s.title[:40]}\n"
+            f"🎯 YES sell: {'✅' if s.yes_sell_order else '❌'} @ {sell_price*100:.0f}¢\n"
+            f"🎯 NO sell: {'✅' if s.no_sell_order else '❌'} @ {sell_price*100:.0f}¢\n"
+            f"⏱ Моніторю fills + stop loss...")
         return
 
     # ── PHASE: MONITORING — check sells + stop loss ───
@@ -423,7 +475,10 @@ async def _manage_session(bot):
                 s.yes_closed = True
                 s.yes_pnl = round(s.yes_shares * _mm_config["sell_target"]
                                   - s.yes_shares * _mm_config["buy_price"], 4)
-                logger.info("MM: YES sold @ 60¢ → +%.2f", s.yes_pnl)
+                await _mm_notify(bot,
+                    f"✅ <b>MM YES SOLD</b> @ 60¢ → +${s.yes_pnl:.2f}\n"
+                    f"📌 {s.title[:40]}\n"
+                    f"🛡 NO → stop loss at 40¢")
 
         # Check NO sell fill
         if s.no_sell_order and s.no_sell_status == "live":
@@ -433,21 +488,26 @@ async def _manage_session(bot):
                 s.no_closed = True
                 s.no_pnl = round(s.no_shares * _mm_config["sell_target"]
                                  - s.no_shares * _mm_config["buy_price"], 4)
-                logger.info("MM: NO sold @ 60¢ → +%.2f", s.no_pnl)
+                await _mm_notify(bot,
+                    f"✅ <b>MM NO SOLD</b> @ 60¢ → +${s.no_pnl:.2f}\n"
+                    f"📌 {s.title[:40]}\n"
+                    f"🛡 YES → stop loss at 40¢")
 
         # ── STOP LOSS CHECK ──────────────────────────
         # If one side sold, check mid of other side for stop loss
         if s.yes_closed and not s.no_closed:
             mid = fetch_midprice(s.no_token)
             if mid and mid <= _mm_config["stop_loss"]:
-                # Stop loss! Sell NO at market
                 if s.no_sell_order and s.no_sell_status == "live":
                     cancel_order(s.no_sell_order)
                 place_market_sell(s.no_token, s.no_shares, s.condition_id)
                 s.no_closed = True
                 s.no_pnl = round(s.no_shares * mid
                                  - s.no_shares * _mm_config["buy_price"], 4)
-                logger.info("MM: NO stop loss @ %.0f¢ → %.2f", mid*100, s.no_pnl)
+                await _mm_notify(bot,
+                    f"🛑 <b>MM STOP LOSS</b> | NO @ {mid*100:.0f}¢\n"
+                    f"📌 {s.title[:40]}\n"
+                    f"💰 NO P&L: ${s.no_pnl:.2f}")
 
         if s.no_closed and not s.yes_closed:
             mid = fetch_midprice(s.yes_token)
@@ -458,7 +518,10 @@ async def _manage_session(bot):
                 s.yes_closed = True
                 s.yes_pnl = round(s.yes_shares * mid
                                   - s.yes_shares * _mm_config["buy_price"], 4)
-                logger.info("MM: YES stop loss @ %.0f¢ → %.2f", mid*100, s.yes_pnl)
+                await _mm_notify(bot,
+                    f"🛑 <b>MM STOP LOSS</b> | YES @ {mid*100:.0f}¢\n"
+                    f"📌 {s.title[:40]}\n"
+                    f"💰 YES P&L: ${s.yes_pnl:.2f}")
 
         # ── EMERGENCY: Close everything 60s before end ─
         if time_left <= 60:
