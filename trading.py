@@ -181,6 +181,7 @@ def place_limit_sell(token_id: str, price: float, size: float, condition_id: str
     Place a limit SELL order (GTC).
     size = number of shares to sell.
     price = price per share.
+    Automatically detects neg_risk markets (BTC up/down etc).
     """
     client = _get_client()
     if not client:
@@ -193,6 +194,9 @@ def place_limit_sell(token_id: str, price: float, size: float, condition_id: str
         price = round(price, 2)
         size = round(size, 2)
 
+        if size < 5:
+            size = 5.0  # Polymarket minimum for some markets
+
         order_args = OrderArgs(
             price=price,
             size=size,
@@ -200,12 +204,22 @@ def place_limit_sell(token_id: str, price: float, size: float, condition_id: str
             token_id=token_id,
         )
 
+        neg_risk = False
+        if condition_id:
+            neg_risk = get_neg_risk(condition_id)
+
         signed = client.create_order(order_args)
         try:
-            resp = client.post_order(signed, OrderType.GTC)
+            resp = client.post_order(signed, orderType=OrderType.GTC, neg_risk=neg_risk)
         except TypeError:
-            resp = client.post_order(signed)
-        logger.info("SELL order placed: price=%s size=%s resp=%s", price, size, resp)
+            try:
+                resp = client.post_order(signed, OrderType.GTC, neg_risk=neg_risk)
+            except TypeError:
+                try:
+                    resp = client.post_order(signed, OrderType.GTC)
+                except TypeError:
+                    resp = client.post_order(signed)
+        logger.info("SELL GTC order: price=%s size=%s neg_risk=%s resp=%s", price, size, neg_risk, resp)
         return {"order_id": resp.get("orderID", ""), "price": price, "size": size, "response": resp}
 
     except Exception as e:
