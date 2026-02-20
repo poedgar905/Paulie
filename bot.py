@@ -926,6 +926,7 @@ async def post_init(app: Application):
         BotCommand("weather_status", "📊 Статус weather"),
         BotCommand("weather_stop", "🛑 Зупинити weather"),
         BotCommand("15min_bot", "🤖 Adaptive BTC Bot"),
+        BotCommand("mm_bot", "🔄 Market Maker Bot"),
     ])
 
     # Start poller
@@ -963,6 +964,11 @@ async def post_init(app: Application):
     from btc_adaptive import adaptive_checker
     asyncio.create_task(adaptive_checker(app.bot))
     logger.info("Adaptive BTC bot checker started")
+
+    # Start MM bot
+    from btc_mm import mm_checker
+    asyncio.create_task(mm_checker(app.bot))
+    logger.info("MM bot checker started")
 
     trading = "✅" if is_trading_enabled() else "❌ (no key)"
     try:
@@ -1533,6 +1539,49 @@ async def snipe_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 # ── Adaptive BTC Bot Commands ────────────────────────────────
 
 @owner_only
+async def mm_bot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mm_bot [status|stop]"""
+    from btc_mm import start_mm, stop_mm, is_mm_active, get_mm_status
+
+    args = context.args or []
+    action = args[0].lower() if args else ""
+
+    if action == "status":
+        await update.message.reply_text(get_mm_status(), parse_mode=ParseMode.HTML)
+        return
+
+    if action == "stop":
+        if not is_mm_active():
+            await update.message.reply_text("🔄 MM Bot вже вимкнений.")
+            return
+        stop_mm()
+        await update.message.reply_text("🛑 MM Bot зупинено. Всі ордери скасовані.")
+        return
+
+    if is_mm_active():
+        await update.message.reply_text(get_mm_status(), parse_mode=ParseMode.HTML)
+        return
+
+    start_mm()
+    await update.message.reply_text(
+        "🔄 <b>Market Maker Bot запущено!</b>\n\n"
+        "Стратегія:\n"
+        "1️⃣ Чекаємо flat + volatile ринок (немає тренду, є коливання)\n"
+        "2️⃣ Купуємо YES 50¢ + NO 50¢\n"
+        "3️⃣ Ставимо sell лімітки 60¢ на обидва\n"
+        "4️⃣ Один продається → +10¢\n"
+        "5️⃣ Другий → stop loss 40¢ (max -10¢)\n\n"
+        "⚙️ Entry: тільки коли BTC < 0.04% change + volatility > $15\n"
+        "🛡 Emergency close за 60с до кінця\n\n"
+        "<code>/mm_bot status</code> — статус\n"
+        "<code>/mm_bot stop</code> — зупинити",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── Adaptive BTC Bot Commands ────────────────────────────────
+
+@owner_only
 async def adaptive_bot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/15min_bot [status|stop]"""
     from btc_adaptive import start_adaptive, stop_adaptive, is_active, get_status
@@ -1691,6 +1740,7 @@ def main():
     app.add_handler(CommandHandler("weather_status", weather_status_cmd))
     app.add_handler(CommandHandler("weather_stop", weather_stop_cmd))
     app.add_handler(CommandHandler("15min_bot", adaptive_bot_cmd))
+    app.add_handler(CommandHandler("mm_bot", mm_bot_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_amount_handler))
 
