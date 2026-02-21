@@ -927,6 +927,7 @@ async def post_init(app: Application):
         BotCommand("weather_stop", "🛑 Зупинити weather"),
         BotCommand("15min_bot", "🤖 Adaptive BTC Bot"),
         BotCommand("mm_bot", "🔄 Market Maker Bot"),
+        BotCommand("liq_bot", "📊 Liquidity Scalper"),
     ])
 
     # Start poller
@@ -969,6 +970,11 @@ async def post_init(app: Application):
     from btc_mm import mm_checker
     asyncio.create_task(mm_checker(app.bot))
     logger.info("MM bot checker started")
+
+    # Start Liquidity scalper
+    from btc_liquidity import liq_checker
+    asyncio.create_task(liq_checker(app.bot))
+    logger.info("Liquidity scalper started")
 
     trading = "✅" if is_trading_enabled() else "❌ (no key)"
     try:
@@ -1579,6 +1585,46 @@ async def mm_bot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@owner_only
+async def liq_bot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/liq_bot [status|stop]"""
+    from btc_liquidity import start_liq, stop_liq, is_liq_active, get_liq_status
+
+    args = context.args or []
+    action = args[0].lower() if args else ""
+
+    if action == "status":
+        await update.message.reply_text(get_liq_status(), parse_mode=ParseMode.HTML)
+        return
+
+    if action == "stop":
+        if not is_liq_active():
+            await update.message.reply_text("📊 Liq Bot вже вимкнений.")
+            return
+        stop_liq()
+        await update.message.reply_text("🛑 Liquidity Scalper зупинено.")
+        return
+
+    if is_liq_active():
+        await update.message.reply_text(get_liq_status(), parse_mode=ParseMode.HTML)
+        return
+
+    start_liq()
+    await update.message.reply_text(
+        "📊 <b>Liquidity Scalper запущено!</b>\n\n"
+        "Стратегія:\n"
+        "1️⃣ Сканую orderbook кожні 3с\n"
+        "2️⃣ Знаходжу великі bid walls (підтримка)\n"
+        "3️⃣ Лімітка на buy трохи вище стіни\n"
+        "4️⃣ Лімітка на sell +8-10¢ вище\n"
+        "5️⃣ Stop loss лімітка нижче стіни\n\n"
+        "💰 <b>Всі ордери — лімітки (0% комісія)</b>\n\n"
+        "<code>/liq_bot status</code> — статус\n"
+        "<code>/liq_bot stop</code> — зупинити",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 # ── Adaptive BTC Bot Commands ────────────────────────────────
 
 @owner_only
@@ -1741,6 +1787,7 @@ def main():
     app.add_handler(CommandHandler("weather_stop", weather_stop_cmd))
     app.add_handler(CommandHandler("15min_bot", adaptive_bot_cmd))
     app.add_handler(CommandHandler("mm_bot", mm_bot_cmd))
+    app.add_handler(CommandHandler("liq_bot", liq_bot_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_amount_handler))
 
