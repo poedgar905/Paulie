@@ -928,6 +928,7 @@ async def post_init(app: Application):
         BotCommand("15min_bot", "🤖 Adaptive BTC Bot"),
         BotCommand("mm_bot", "🔄 Market Maker Bot"),
         BotCommand("liq_bot", "📊 Liquidity Scalper"),
+        BotCommand("weather_trade", "🌤 Weather Trader"),
     ])
 
     # Start poller
@@ -975,6 +976,11 @@ async def post_init(app: Application):
     from btc_liquidity import liq_checker
     asyncio.create_task(liq_checker(app.bot))
     logger.info("Liquidity scalper started")
+
+    # Start Weather trader
+    from weather_trader import weather_checker
+    asyncio.create_task(weather_checker(app.bot))
+    logger.info("Weather trader started")
 
     trading = "✅" if is_trading_enabled() else "❌ (no key)"
     try:
@@ -1625,6 +1631,47 @@ async def liq_bot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@owner_only
+async def weather_trade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/weather_trade [status|stop]"""
+    from weather_trader import start_weather, stop_weather, is_weather_active, get_weather_status
+
+    args = context.args or []
+    action = args[0].lower() if args else ""
+
+    if action == "status":
+        await update.message.reply_text(get_weather_status(), parse_mode=ParseMode.HTML)
+        return
+
+    if action == "stop":
+        if not is_weather_active():
+            await update.message.reply_text("🌤 Weather Trader вже вимкнений.")
+            return
+        stop_weather()
+        await update.message.reply_text("🛑 Weather Trader зупинено.")
+        return
+
+    if is_weather_active():
+        await update.message.reply_text(get_weather_status(), parse_mode=ParseMode.HTML)
+        return
+
+    start_weather()
+    await update.message.reply_text(
+        "🌤 <b>Weather Trader запущено!</b>\n\n"
+        "Стратегія:\n"
+        "1️⃣ 3 Weather APIs (Open-Meteo, OWM, WeatherAPI)\n"
+        "2️⃣ Консенсус 2/3 = high confidence\n"
+        "3️⃣ Купую найбільш вірогідний outcome по лімітці\n"
+        "4️⃣ Кожні 15с перевіряю прогноз\n"
+        "5️⃣ Прогноз змінився → продаю + купую нову позицію\n\n"
+        "🏙 Ринки: London\n"
+        "📡 Оновлення: кожні 15 секунд\n\n"
+        "<code>/weather_trade status</code> — статус\n"
+        "<code>/weather_trade stop</code> — зупинити",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 # ── Adaptive BTC Bot Commands ────────────────────────────────
 
 @owner_only
@@ -1788,6 +1835,7 @@ def main():
     app.add_handler(CommandHandler("15min_bot", adaptive_bot_cmd))
     app.add_handler(CommandHandler("mm_bot", mm_bot_cmd))
     app.add_handler(CommandHandler("liq_bot", liq_bot_cmd))
+    app.add_handler(CommandHandler("weather_trade", weather_trade_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_amount_handler))
 
