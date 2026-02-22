@@ -197,15 +197,16 @@ async def _run_scalp_cycle(bot):
     buy_price = round(min(mid + 0.02, 0.58), 2)
     target = round(buy_price + 0.10, 2)
     stop = round(buy_price - 0.10, 2)
-    size_usdc = 2.50
-
-    import math
-    shares = max(math.ceil(size_usdc * 1.05 / buy_price * 100) / 100, 5.0)
+    size_usdc = 1.0  # $1 per trade
 
     result = place_limit_buy(token_id, buy_price, size_usdc, live["condition_id"])
     if not result or not result.get("order_id"):
         await _mm_notify(bot, f"⚠️ <b>SCALP FAIL</b> | Buy failed\n📌 {live['question'][:50]}")
         return
+
+    # Get actual shares from order (may be 5 min on neg_risk)
+    shares = result.get("size", 5.0)
+    cost = round(shares * buy_price, 2)
 
     buy_st = "matched" if result.get("response", {}).get("status") == "matched" else "live"
 
@@ -213,7 +214,7 @@ async def _run_scalp_cycle(bot):
         slug=slug, condition_id=live["condition_id"], title=live["question"],
         market_end_ts=end_ts, token_id=token_id, direction=sig.direction,
         buy_order_id=result["order_id"], buy_status=buy_st, buy_price=buy_price,
-        shares=shares, cost=round(shares * buy_price, 2),
+        shares=shares, cost=cost,
         target_price=target, stop_price=stop,
         entered_at=now, reason=sig.reason, btc_momentum=sig.strength,
     )
