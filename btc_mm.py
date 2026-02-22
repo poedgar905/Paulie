@@ -174,9 +174,9 @@ async def _run_scalp_cycle(bot):
     time_left = end_ts - now
     time_elapsed = 900 - time_left
 
-    if time_elapsed < 120 or time_elapsed > 600:
+    if time_elapsed < 30 or time_elapsed > 420:
         return
-    if time_left < 180:
+    if time_left < 120:
         return
     if slug in _traded_slugs:
         return
