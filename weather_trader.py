@@ -89,29 +89,139 @@ def find_weather_market(city_key: str) -> dict | None:
     if not city:
         return None
     try:
+        # Build possible slugs for today and tomorrow
+        now_utc = datetime.now(timezone.utc)
+        slugs_to_try = []
+        for delta in [0, 1, 2]:
+            d = now_utc + timedelta(days=delta)
+            month = d.strftime("%B").lower()
+            day = d.day
+            slug = f"{city['slug_pattern']}{month}-{day}"
+            slugs_to_try.append((slug, d.strftime("%Y-%m-%d")))
+
+        for slug, target_date in slugs_to_try:
+            # Try fetching event by slug directly
+            resp = requests.get(
+                f"https://gamma-api.polymarket.com/events/slug/{slug}",
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                event = resp.json()
+                if not event or event.get("closed"):
+                    continue
+                markets = event.get("markets", [])
+                if not markets:
+                    continue
+
+                outcomes = []
+                for m in markets:
+                    if m.get("closed"):
+                        continue
+                    cids = m.get("clobTokenIds", [])
+                    prices = m.get("outcomePrices", "")
+                    try:
+                        if isinstance(prices, str):
+                            prices = json.loads(prices)
+                        price_yes = float(prices[0]) if prices else 0
+                    except Exception:
+                        price_yes = 0
+
+                    outcomes.append({
+                        "question": m.get("question", ""),
+                        "condition_id": m.get("conditionId", ""),
+                        "token_yes": cids[0] if cids else "",
+                        "token_no": cids[1] if len(cids) > 1 else "",
+                        "price_yes": price_yes,
+                        "closed": m.get("closed", False),
+                    })
+
+                if outcomes:
+                    logger.info("Found weather market: %s (%d outcomes)", slug, len(outcomes))
+                    return {
+                        "slug": slug,
+                        "title": event.get("title", slug),
+                        "outcomes": outcomes,
+                        "target_date": target_date,
+                    }
+
+        # Fallback: search markets endpoint
         resp = requests.get(
-            "https://gamma-api.polymarket.com/events",
-            params={"closed": "false", "limit": 30, "tag": "Weather"},
+            "https://gamma-api.polymarket.com/markets",
+            params={
+                "closed": "false",
+                "limit": 50,
+                "order": "volume24hr",
+                "ascending": "false",
+            },
             timeout=15,
         )
-        if resp.status_code != 200:
-            return None
-        events = resp.json()
-        if not isinstance(events, list):
-            return None
+        if resp.status_code == 200:
+            markets = resp.json()
+            if isinstance(markets, list):
+                for m in markets:
+                    q = m.get("question", "").lower()
+                    if ("temperature" in q and city["name"].lower() in q
+                            and not m.get("closed")):
+                        # Found a matching market — extract date
+                        date_match = re.search(r'(\w+)\s+(\d+)\??$', m.get("question", ""))
+                        target_date = ""
+                        if date_match:
+                            try:
+                                month_str = date_match.group(1)
+                                day_str = date_match.group(2)
+                                month_num = datetime.strptime(month_str, "%B").month
+                                target_date = f"{now_utc.year}-{month_num:02d}-{int(day_str):02d}"
+                            except Exception:
+                                pass
 
-        for event in events:
-            slug = event.get("slug", "")
-            title = event.get("title", "")
-            if city["slug_pattern"] not in slug and city["name"].lower() not in title.lower():
-                continue
+                        cids = m.get("clobTokenIds", [])
+                        prices = m.get("outcomePrices", "")
+                        try:
+                            if isinstance(prices, str):
+                                prices = json.loads(prices)
+                            price_yes = float(prices[0]) if prices else 0
+                        except Exception:
+                            price_yes = 0
 
+                        # This is a single sub-market, need to find parent event
+                        event_slug = m.get("eventSlug", "")
+                        if event_slug:
+                            return find_weather_market_by_event_slug(event_slug, target_date)
+
+                        return {
+                            "slug": m.get("slug", ""),
+                            "title": m.get("question", ""),
+                            "outcomes": [{
+                                "question": m.get("question", ""),
+                                "condition_id": m.get("conditionId", ""),
+                                "token_yes": cids[0] if cids else "",
+                                "token_no": cids[1] if len(cids) > 1 else "",
+                                "price_yes": price_yes,
+                                "closed": False,
+                            }],
+                            "target_date": target_date,
+                        }
+
+    except Exception as e:
+        logger.error("Weather market finder: %s", e)
+    return None
+
+
+def find_weather_market_by_event_slug(event_slug: str, target_date: str) -> dict | None:
+    """Fetch event by slug to get all sub-markets."""
+    import requests
+    try:
+        resp = requests.get(
+            f"https://gamma-api.polymarket.com/events/slug/{event_slug}",
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            event = resp.json()
             markets = event.get("markets", [])
-            if not markets:
-                continue
-
             outcomes = []
             for m in markets:
+                if m.get("closed"):
+                    continue
                 cids = m.get("clobTokenIds", [])
                 prices = m.get("outcomePrices", "")
                 try:
@@ -120,37 +230,23 @@ def find_weather_market(city_key: str) -> dict | None:
                     price_yes = float(prices[0]) if prices else 0
                 except Exception:
                     price_yes = 0
-
                 outcomes.append({
                     "question": m.get("question", ""),
                     "condition_id": m.get("conditionId", ""),
                     "token_yes": cids[0] if cids else "",
                     "token_no": cids[1] if len(cids) > 1 else "",
                     "price_yes": price_yes,
-                    "closed": m.get("closed", False),
+                    "closed": False,
                 })
-
-            # Extract date from slug: "highest-temperature-in-london-on-february-23"
-            date_match = re.search(r'on-(\w+)-(\d+)', slug)
-            target_date = ""
-            if date_match:
-                month_str = date_match.group(1)
-                day_str = date_match.group(2)
-                try:
-                    month_num = datetime.strptime(month_str, "%B").month
-                    year = datetime.now().year
-                    target_date = f"{year}-{month_num:02d}-{int(day_str):02d}"
-                except Exception:
-                    pass
-
-            return {
-                "slug": slug,
-                "title": title,
-                "outcomes": [o for o in outcomes if not o["closed"]],
-                "target_date": target_date,
-            }
+            if outcomes:
+                return {
+                    "slug": event_slug,
+                    "title": event.get("title", event_slug),
+                    "outcomes": outcomes,
+                    "target_date": target_date,
+                }
     except Exception as e:
-        logger.error("Weather market finder: %s", e)
+        logger.error("Event slug fetch: %s", e)
     return None
 
 
