@@ -356,9 +356,7 @@ async def _run_liq_cycle(bot):
     if len(_traded_slugs) > 30:
         _traded_slugs.clear()
 
-    size_usdc = 2.50
-    import math
-    shares = max(math.ceil(size_usdc * 1.05 / best.entry_price * 100) / 100, 5.0)
+    size_usdc = 1.0  # $1 per trade
 
     # Place limit buy
     result = place_limit_buy(
@@ -367,6 +365,9 @@ async def _run_liq_cycle(bot):
         await _notify(bot, f"⚠️ <b>LIQ FAIL</b> | Buy failed\n📌 {live['question'][:50]}")
         return
 
+    # Get actual shares from order (may be 5 min on neg_risk)
+    shares = result.get("size", 5.0)
+    cost = round(shares * best.entry_price, 2)
     buy_st = "matched" if result.get("response", {}).get("status") == "matched" else "live"
 
     _active_trade = LiqTrade(
@@ -375,7 +376,7 @@ async def _run_liq_cycle(bot):
         token_id=best.token_id, direction=best.side,
         buy_order_id=result["order_id"], buy_status=buy_st,
         buy_price=best.entry_price, shares=shares,
-        cost=round(shares * best.entry_price, 2),
+        cost=cost,
         exit_price=best.exit_price, stop_price=best.stop_price,
         entered_at=now,
         reason=(f"Wall {best.support_size:.0f} shares @ {best.support_price*100:.0f}¢ | "
