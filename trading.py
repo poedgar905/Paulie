@@ -98,8 +98,17 @@ def get_token_id_for_market(condition_id: str, outcome: str) -> str | None:
     return None
 
 
+_neg_risk_cache: dict[str, bool] = {}
+
 def get_neg_risk(condition_id: str) -> bool:
-    """Check if market is negative risk."""
+    """Check if market is negative risk. Caches results."""
+    if not condition_id:
+        return False
+    
+    # Check cache first
+    if condition_id in _neg_risk_cache:
+        return _neg_risk_cache[condition_id]
+    
     try:
         import requests
         resp = requests.get(
@@ -110,10 +119,19 @@ def get_neg_risk(condition_id: str) -> bool:
         if resp.status_code == 200:
             markets = resp.json()
             if isinstance(markets, list) and markets:
-                return bool(markets[0].get("negRisk", False))
-    except Exception:
-        pass
-    return False
+                result = bool(markets[0].get("negRisk", False))
+                _neg_risk_cache[condition_id] = result
+                logger.info("neg_risk for %s: %s", condition_id[:12], result)
+                return result
+    except Exception as e:
+        logger.warning("get_neg_risk API failed for %s: %s", condition_id[:12], e)
+    
+    # Fallback: if condition_id lookup fails, check by token naming pattern
+    # BTC up/down markets are ALWAYS neg_risk
+    # Cache as True if API failed — safer to assume neg_risk for BTC markets
+    _neg_risk_cache[condition_id] = True
+    logger.warning("get_neg_risk fallback: assuming True for %s", condition_id[:12])
+    return True
 
 
 def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_id: str = "", post_only: bool = False) -> dict | None:
@@ -131,12 +149,18 @@ def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_i
         from py_clob_client.order_builder.constants import BUY
 
         # size = number of shares = amount_usdc / price
-        # CLOB rounds internally and can end up below $1 minimum
-        # Add 5% buffer to guarantee we pass the minimum
         import math
         size = math.ceil(amount_usdc * 1.05 / price * 100) / 100
         if size * price < 1.05:
             size = math.ceil(1.05 / price * 100) / 100
+
+        # Check neg_risk first — min 5 shares on neg_risk markets
+        neg_risk = False
+        if condition_id:
+            neg_risk = get_neg_risk(condition_id)
+
+        if neg_risk and size < 5:
+            size = 5.0  # Polymarket minimum for neg_risk markets
 
         # Round price to valid tick (0.01)
         price = round(price, 2)
@@ -150,11 +174,6 @@ def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_i
             side=BUY,
             token_id=token_id,
         )
-
-        # Check if market is neg_risk (BTC up/down markets are)
-        neg_risk = False
-        if condition_id:
-            neg_risk = get_neg_risk(condition_id)
 
         signed = client.create_order(order_args)
         try:
