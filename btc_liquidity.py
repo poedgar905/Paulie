@@ -328,10 +328,10 @@ async def _run_liq_cycle(bot):
     time_left = end_ts - now
     time_elapsed = 900 - time_left
 
-    # Enter between minute 2-11 (enough time for oscillation)
-    if time_elapsed < 120 or time_elapsed > 660:
+    # Enter from 30s into market until minute 10
+    if time_elapsed < 30 or time_elapsed > 600:
         return
-    if time_left < 180:
+    if time_left < 120:
         return
     if slug in _traded_slugs:
         return
