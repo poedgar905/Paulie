@@ -2,14 +2,12 @@
 weather_trader.py — Weather Trading Bot for Polymarket
 
 Strategy:
-  1. Find active weather market (London) on Polymarket via Gamma API
-  2. Fetch hourly forecast from Open-Meteo (free, no key)
-  3. Buy most likely temperature outcome by limit order ($1)
-  4. Every 60s: re-check. If forecast changes → sell old, buy new
-  5. Hold until resolution → $1 per winning share
-
-Resolution source: Wunderground — London City Airport (EGLC)
-Polymarket shows °C outcomes, resolves by °F rounded to whole degrees.
+  1. Find active weather market (London) via slug
+  2. Fetch forecast from Open-Meteo (free, no key)
+  3. Buy most likely outcome by limit ($1)
+  4. Every 5s check orders; every 5min re-check forecast
+  5. If forecast changes → cancel/sell old → buy new
+  6. Hold winning position until resolution
 
 Command: /weather_trade [start|stop|status]
 """
@@ -24,8 +22,6 @@ from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger(__name__)
 
-# ── Config ───────────────────────────────────────────────
-
 CITIES = {
     "london": {
         "name": "London",
@@ -39,18 +35,15 @@ _stats = {
     "wins": 0, "losses": 0, "total_pnl": 0.0,
     "total_trades": 0, "switches": 0, "started_at": 0,
 }
-_forecast_cache: dict[str, tuple[int, dict]] = {}  # key → (timestamp, forecast)
-FORECAST_TTL = 300  # re-fetch forecast every 5 min
+_forecast_cache: dict[str, tuple[int, dict]] = {}
+_market_cache: dict[str, tuple[int, dict]] = {}
+FORECAST_TTL = 300  # 5 min
+MARKET_TTL = 120    # 2 min
 
 
 # ── Open-Meteo ───────────────────────────────────────────
 
 def fetch_forecast(lat: float, lon: float, target_date: str) -> dict | None:
-    """
-    Fetch hourly forecast from Open-Meteo.
-    target_date: "2026-02-23"
-    Returns: {high_c: 13, hourly: [...], source: "Open-Meteo"}
-    """
     import requests
     try:
         resp = requests.get(
@@ -70,220 +63,107 @@ def fetch_forecast(lat: float, lon: float, target_date: str) -> dict | None:
             if temps:
                 high = max(temps)
                 return {
-                    "high_c": round(high),  # whole °C for Polymarket
+                    "high_c": round(high),
                     "high_exact": round(high, 1),
                     "hourly": temps,
-                    "source": "Open-Meteo",
                 }
     except Exception as e:
         logger.warning("Open-Meteo error: %s", e)
     return None
 
 
-# ── Polymarket Market ────────────────────────────────────
+# ── Polymarket ───────────────────────────────────────────
+
+def _parse_market_outcomes(markets: list) -> list:
+    """Parse market list into clean outcomes."""
+    outcomes = []
+    for m in markets:
+        if m.get("closed"):
+            continue
+        cids = m.get("clobTokenIds", [])
+        if isinstance(cids, str):
+            try:
+                cids = json.loads(cids)
+            except Exception:
+                cids = []
+        prices = m.get("outcomePrices", "")
+        try:
+            if isinstance(prices, str):
+                prices = json.loads(prices)
+            price_yes = float(prices[0]) if prices else 0
+        except Exception:
+            price_yes = 0
+
+        token_yes = cids[0] if len(cids) > 0 else ""
+        token_no = cids[1] if len(cids) > 1 else ""
+
+        if token_yes:  # skip if no token
+            outcomes.append({
+                "question": m.get("question", ""),
+                "condition_id": m.get("conditionId", ""),
+                "token_yes": token_yes,
+                "token_no": token_no,
+                "price_yes": price_yes,
+            })
+    return outcomes
+
 
 def find_weather_market(city_key: str) -> dict | None:
-    """Find active weather market for city via Gamma API."""
     import requests
     city = CITIES.get(city_key)
     if not city:
         return None
+
+    now = int(time.time())
+    cached = _market_cache.get(city_key)
+    if cached and now - cached[0] < MARKET_TTL:
+        return cached[1]
+
     try:
-        # Build possible slugs for today and tomorrow
         now_utc = datetime.now(timezone.utc)
-        slugs_to_try = []
         for delta in [0, 1, 2]:
             d = now_utc + timedelta(days=delta)
-            month = d.strftime("%B").lower()
-            day = d.day
-            year = d.year
-            # Format: highest-temperature-in-london-on-february-23-2026
-            slug = f"{city['slug_pattern']}{month}-{day}-{year}"
-            slugs_to_try.append((slug, d.strftime("%Y-%m-%d")))
+            slug = f"{city['slug_pattern']}{d.strftime('%B').lower()}-{d.day}-{d.year}"
+            td = d.strftime("%Y-%m-%d")
 
-        for slug, target_date in slugs_to_try:
-            # Try fetching event by slug directly
             resp = requests.get(
                 f"https://gamma-api.polymarket.com/events/slug/{slug}",
                 timeout=15,
             )
-            if resp.status_code == 200:
-                event = resp.json()
-                if not event or event.get("closed"):
-                    continue
-                markets = event.get("markets", [])
-                if not markets:
-                    continue
-
-                outcomes = []
-                for m in markets:
-                    if m.get("closed"):
-                        continue
-                    cids = m.get("clobTokenIds", [])
-                    if isinstance(cids, str):
-                        try:
-                            cids = json.loads(cids)
-                        except Exception:
-                            cids = []
-                    prices = m.get("outcomePrices", "")
-                    try:
-                        if isinstance(prices, str):
-                            prices = json.loads(prices)
-                        price_yes = float(prices[0]) if prices else 0
-                    except Exception:
-                        price_yes = 0
-
-                    outcomes.append({
-                        "question": m.get("question", ""),
-                        "condition_id": m.get("conditionId", ""),
-                        "token_yes": cids[0] if cids else "",
-                        "token_no": cids[1] if len(cids) > 1 else "",
-                        "price_yes": price_yes,
-                        "closed": m.get("closed", False),
-                    })
-
-                if outcomes:
-                    logger.info("Found weather market: %s (%d outcomes)", slug, len(outcomes))
-                    return {
-                        "slug": slug,
-                        "title": event.get("title", slug),
-                        "outcomes": outcomes,
-                        "target_date": target_date,
-                    }
-
-        # Fallback: search markets endpoint
-        resp = requests.get(
-            "https://gamma-api.polymarket.com/markets",
-            params={
-                "closed": "false",
-                "limit": 50,
-                "order": "volume24hr",
-                "ascending": "false",
-            },
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            markets = resp.json()
-            if isinstance(markets, list):
-                for m in markets:
-                    q = m.get("question", "").lower()
-                    if ("temperature" in q and city["name"].lower() in q
-                            and not m.get("closed")):
-                        # Found a matching market — extract date
-                        date_match = re.search(r'(\w+)\s+(\d+)\??$', m.get("question", ""))
-                        target_date = ""
-                        if date_match:
-                            try:
-                                month_str = date_match.group(1)
-                                day_str = date_match.group(2)
-                                month_num = datetime.strptime(month_str, "%B").month
-                                target_date = f"{now_utc.year}-{month_num:02d}-{int(day_str):02d}"
-                            except Exception:
-                                pass
-
-                        cids = m.get("clobTokenIds", [])
-                        if isinstance(cids, str):
-                            try:
-                                cids = json.loads(cids)
-                            except Exception:
-                                cids = []
-                        prices = m.get("outcomePrices", "")
-                        try:
-                            if isinstance(prices, str):
-                                prices = json.loads(prices)
-                            price_yes = float(prices[0]) if prices else 0
-                        except Exception:
-                            price_yes = 0
-
-                        # This is a single sub-market, need to find parent event
-                        event_slug = m.get("eventSlug", "")
-                        if event_slug:
-                            return find_weather_market_by_event_slug(event_slug, target_date)
-
-                        return {
-                            "slug": m.get("slug", ""),
-                            "title": m.get("question", ""),
-                            "outcomes": [{
-                                "question": m.get("question", ""),
-                                "condition_id": m.get("conditionId", ""),
-                                "token_yes": cids[0] if cids else "",
-                                "token_no": cids[1] if len(cids) > 1 else "",
-                                "price_yes": price_yes,
-                                "closed": False,
-                            }],
-                            "target_date": target_date,
-                        }
-
+            if resp.status_code != 200:
+                continue
+            event = resp.json()
+            if not event or event.get("closed"):
+                continue
+            markets = event.get("markets", [])
+            outcomes = _parse_market_outcomes(markets)
+            if outcomes:
+                result = {
+                    "slug": slug,
+                    "title": event.get("title", slug),
+                    "outcomes": outcomes,
+                    "target_date": td,
+                }
+                _market_cache[city_key] = (now, result)
+                logger.info("Found weather market: %s (%d outcomes)", slug, len(outcomes))
+                return result
     except Exception as e:
         logger.error("Weather market finder: %s", e)
     return None
 
 
-def find_weather_market_by_event_slug(event_slug: str, target_date: str) -> dict | None:
-    """Fetch event by slug to get all sub-markets."""
-    import requests
-    try:
-        resp = requests.get(
-            f"https://gamma-api.polymarket.com/events/slug/{event_slug}",
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            event = resp.json()
-            markets = event.get("markets", [])
-            outcomes = []
-            for m in markets:
-                if m.get("closed"):
-                    continue
-                cids = m.get("clobTokenIds", [])
-                if isinstance(cids, str):
-                    try:
-                        cids = json.loads(cids)
-                    except Exception:
-                        cids = []
-                prices = m.get("outcomePrices", "")
-                try:
-                    if isinstance(prices, str):
-                        prices = json.loads(prices)
-                    price_yes = float(prices[0]) if prices else 0
-                except Exception:
-                    price_yes = 0
-                outcomes.append({
-                    "question": m.get("question", ""),
-                    "condition_id": m.get("conditionId", ""),
-                    "token_yes": cids[0] if cids else "",
-                    "token_no": cids[1] if len(cids) > 1 else "",
-                    "price_yes": price_yes,
-                    "closed": False,
-                })
-            if outcomes:
-                return {
-                    "slug": event_slug,
-                    "title": event.get("title", event_slug),
-                    "outcomes": outcomes,
-                    "target_date": target_date,
-                }
-    except Exception as e:
-        logger.error("Event slug fetch: %s", e)
-    return None
-
-
 def match_outcome(market: dict, temp_c: int) -> dict | None:
-    """Find outcome matching target temperature."""
     if not market:
         return None
-
     for o in market.get("outcomes", []):
         q = o["question"]
         nums = re.findall(r'(\d+)\s*°', q)
         if not nums:
             continue
         t = int(nums[0])
-
-        # Exact match (no "below"/"higher")
         if t == temp_c and "below" not in q.lower() and "higher" not in q.lower() and "above" not in q.lower():
             return o
-
-    # Edge: "X°C or below" / "X°C or higher"
+    # Edge cases
     for o in market.get("outcomes", []):
         q = o["question"].lower()
         nums = re.findall(r'(\d+)\s*°', q)
@@ -313,9 +193,9 @@ class Position:
     shares: float = 0
     cost: float = 0
     filled: bool = False
+    switching: bool = False  # True while selling old position
     entered_at: int = 0
     last_check: int = 0
-
 
 _positions: dict[str, Position] = {}
 
@@ -349,43 +229,47 @@ async def weather_checker(bot):
 
 
 async def _trade_city(bot, city_key: str):
-    from trading import place_limit_buy, place_market_sell, check_order_status, cancel_order
+    from trading import place_limit_buy, place_limit_sell, cancel_order, check_order_status
     from sniper import fetch_midprice
 
     city = CITIES[city_key]
     now = int(time.time())
     pos = _positions.get(city_key)
 
-    # ── Find market (cache-friendly, gamma changes rarely) ─
-    if not hasattr(_trade_city, '_market_cache'):
-        _trade_city._market_cache = {}
-    mc = _trade_city._market_cache.get(city_key)
-    if not mc or now - mc[0] > 120:  # refresh market every 2 min
-        market = find_weather_market(city_key)
-        if market:
-            _trade_city._market_cache[city_key] = (now, market)
-        else:
-            return
-    else:
-        market = mc[1]
-
-    td = market.get("target_date", "")
-    if not td:
+    # ── Find market ───────────────────────────────────
+    market = find_weather_market(city_key)
+    if not market or not market.get("target_date"):
         return
+    td = market["target_date"]
 
-    # ── Check fill on existing position (every 5s) ────
-    if pos:
-        pos.last_check = now
+    # ── If we have position on DIFFERENT date → it's expired ─
+    if pos and pos.target_date != td:
+        logger.info("Position expired: %s (market now %s)", pos.target_date, td)
+        # Old market resolved or closed, clear position
         if not pos.filled and pos.order_id:
-            from trading import check_order_status
-            st = check_order_status(pos.order_id)
-            if st and st.lower() == "matched":
-                pos.filled = True
-                await _notify(bot,
-                    f"✅ <b>WEATHER FILLED</b> | {city['name']} {td}\n"
-                    f"🌡 {pos.temp_c}°C @ {pos.buy_price*100:.0f}¢")
+            cancel_order(pos.order_id)
+        del _positions[city_key]
+        pos = None
 
-    # ── Get forecast (cached, refresh every 5 min) ────
+    # ── Check fill on existing position ───────────────
+    if pos and not pos.filled and pos.order_id:
+        st = check_order_status(pos.order_id)
+        if st and st.lower() == "matched":
+            pos.filled = True
+            _save_state()
+            await _notify(bot,
+                f"✅ <b>WEATHER FILLED</b> | {city['name']} {td}\n"
+                f"🌡 {pos.temp_c}°C @ {pos.buy_price*100:.0f}¢")
+        elif now - pos.entered_at > 300 and not pos.filled:
+            # Not filled in 5 min → cancel and retry at better price
+            cancel_order(pos.order_id)
+            await _notify(bot,
+                f"⏰ <b>WEATHER CANCEL</b> | Not filled 5min\n"
+                f"🌡 {pos.temp_c}°C @ {pos.buy_price*100:.0f}¢ — will retry")
+            del _positions[city_key]
+            pos = None
+
+    # ── Get forecast (cached 5 min) ───────────────────
     cache_key = f"{city_key}:{td}"
     cached = _forecast_cache.get(cache_key)
     if cached and now - cached[0] < FORECAST_TTL:
@@ -396,55 +280,89 @@ async def _trade_city(bot, city_key: str):
             _forecast_cache[cache_key] = (now, fc)
         else:
             return
-
     forecast_c = fc["high_c"]
 
-    # ── Find matching outcome ─────────────────────────
+    # ── Match outcome ─────────────────────────────────
     outcome = match_outcome(market, forecast_c)
     if not outcome or not outcome["token_yes"]:
         return
 
-    # ── Have position? ────────────────────────────────
+    # ── Have position with same forecast → hold ───────
+    if pos and forecast_c == pos.temp_c:
+        return
+
+    # ── FORECAST CHANGED (or no position) → ACT ──────
     if pos:
-        pos.last_check = now
-
-        # Check fill
-        if not pos.filled and pos.order_id:
-            st = check_order_status(pos.order_id)
-            if st and st.lower() == "matched":
-                pos.filled = True
-                await _notify(bot,
-                    f"✅ <b>WEATHER FILLED</b> | {city['name']} {td}\n"
-                    f"🌡 {pos.temp_c}°C @ {pos.buy_price*100:.0f}¢")
-
-        # Same forecast → hold
-        if forecast_c == pos.temp_c:
-            return
-
-        # ── FORECAST CHANGED → SWITCH ─────────────────
         old = pos.temp_c
-
         if not pos.filled:
-            # Not filled yet → just cancel and re-enter
+            # Easy: just cancel unfilled order
             cancel_order(pos.order_id)
             await _notify(bot,
                 f"🔄 <b>SWITCH</b> | {city['name']}\n"
-                f"🌡 {old}°C → {forecast_c}°C (cancel unfilled)")
+                f"🌡 {old}°C → {forecast_c}°C (cancelled unfilled)")
+            del _positions[city_key]
+            pos = None
         else:
-            # Filled → sell at market, then re-enter
-            place_market_sell(pos.token_id, pos.shares, pos.condition_id)
+            # Hard: need to sell filled position
+            # Use limit sell at current mid for 0 commission
+            mid = fetch_midprice(pos.token_id)
+            if not mid or mid < 0.02:
+                mid = 0.02
+
+            sell_price = round(max(mid - 0.01, 0.01), 2)
+            sell_res = place_limit_sell(
+                pos.token_id, sell_price, pos.shares, pos.condition_id)
+
+            if sell_res and sell_res.get("order_id"):
+                # Check if instant fill
+                resp = sell_res.get("response", {})
+                if resp.get("status") == "matched":
+                    pnl = round(pos.shares * sell_price - pos.cost, 4)
+                    _stats["switches"] += 1
+                    _stats["total_pnl"] += pnl
+                    await _notify(bot,
+                        f"🔄 <b>SWITCH SOLD</b> | {city['name']}\n"
+                        f"🌡 {old}°C → {forecast_c}°C\n"
+                        f"💰 Sold @ {sell_price*100:.0f}¢ (P&L: ${pnl:+.2f})")
+                    del _positions[city_key]
+                    pos = None
+                else:
+                    # Sell placed but not filled yet — wait for next cycle
+                    pos.switching = True
+                    pos.order_id = sell_res["order_id"]
+                    await _notify(bot,
+                        f"🔄 <b>SWITCH SELLING</b> | {city['name']}\n"
+                        f"🌡 {old}°C → {forecast_c}°C\n"
+                        f"📤 Sell limit @ {sell_price*100:.0f}¢ pending...")
+                    _save_state()
+                    return  # Don't enter new position yet
+            else:
+                logger.error("Switch sell failed for %s", city_key)
+                await _notify(bot,
+                    f"⚠️ <b>SWITCH SELL FAIL</b> | {city['name']}\n"
+                    f"🌡 Tried {old}°C → {forecast_c}°C")
+                return
+
+    # If position is in switching state, check if sell filled
+    if pos and pos.switching:
+        st = check_order_status(pos.order_id)
+        if st and st.lower() == "matched":
             mid = fetch_midprice(pos.token_id) or pos.buy_price
             pnl = round(pos.shares * mid - pos.cost, 4)
             _stats["switches"] += 1
+            _stats["total_pnl"] += pnl
             await _notify(bot,
-                f"🔄 <b>SWITCH</b> | {city['name']}\n"
-                f"🌡 {old}°C → {forecast_c}°C\n"
-                f"💰 Sold @ {mid*100:.0f}¢ (P&L: ${pnl:.2f})")
+                f"✅ <b>SWITCH SOLD</b> | {city['name']}\n"
+                f"💰 P&L: ${pnl:+.2f}")
+            del _positions[city_key]
+            pos = None
+        else:
+            return  # Still waiting for sell to fill
 
-        del _positions[city_key]
-        pos = None
+    # ── ENTER new position ────────────────────────────
+    if pos:
+        return  # Still have position, don't double-enter
 
-    # ── ENTER ─────────────────────────────────────────
     token = outcome["token_yes"]
     cid = outcome["condition_id"]
 
@@ -452,7 +370,7 @@ async def _trade_city(bot, city_key: str):
     if not mid:
         mid = outcome.get("price_yes", 0)
     if not mid or mid > 0.90:
-        return  # too expensive
+        return
 
     buy_price = round(max(min(mid + 0.02, 0.90), 0.05), 2)
 
@@ -478,8 +396,78 @@ async def _trade_city(bot, city_key: str):
         f"🌤 <b>WEATHER BUY</b> | {city['name']} {td}\n"
         f"🌡 {forecast_c}°C (exact: {fc['high_exact']}°C)\n"
         f"💰 {buy_price*100:.0f}¢ × {shares} sh = ${cost:.2f}\n"
-        f"📊 Open-Meteo forecast\n"
         f"{'✅ Filled' if is_filled else '⏳ Pending'}")
+
+
+# ── Persistence ──────────────────────────────────────────
+
+def _save_state():
+    from config import DB_PATH
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("CREATE TABLE IF NOT EXISTS weather_trader (key TEXT PRIMARY KEY, value TEXT)")
+
+        # Save stats
+        c.execute("INSERT OR REPLACE INTO weather_trader VALUES (?,?)",
+                  ("stats", json.dumps(_stats)))
+
+        # Save positions
+        pos_data = {}
+        for ck, p in _positions.items():
+            pos_data[ck] = {
+                "city": p.city, "slug": p.slug, "target_date": p.target_date,
+                "outcome": p.outcome, "condition_id": p.condition_id,
+                "token_id": p.token_id, "temp_c": p.temp_c,
+                "order_id": p.order_id, "buy_price": p.buy_price,
+                "shares": p.shares, "cost": p.cost, "filled": p.filled,
+                "switching": p.switching, "entered_at": p.entered_at,
+            }
+        c.execute("INSERT OR REPLACE INTO weather_trader VALUES (?,?)",
+                  ("positions", json.dumps(pos_data)))
+
+        c.execute("INSERT OR REPLACE INTO weather_trader VALUES (?,?)",
+                  ("active", json.dumps(_active)))
+
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error("Save weather: %s", e)
+
+
+def _load_state():
+    from config import DB_PATH
+    global _active
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("CREATE TABLE IF NOT EXISTS weather_trader (key TEXT PRIMARY KEY, value TEXT)")
+
+        # Load active
+        row = c.execute("SELECT value FROM weather_trader WHERE key='active'").fetchone()
+        if row:
+            _active = json.loads(row[0])
+
+        # Load stats
+        row = c.execute("SELECT value FROM weather_trader WHERE key='stats'").fetchone()
+        if row:
+            s = json.loads(row[0])
+            for k in _stats:
+                _stats[k] = s.get(k, 0)
+            _stats["started_at"] = int(time.time())
+
+        # Load positions
+        row = c.execute("SELECT value FROM weather_trader WHERE key='positions'").fetchone()
+        if row:
+            pos_data = json.loads(row[0])
+            for ck, pd in pos_data.items():
+                _positions[ck] = Position(**pd, last_check=int(time.time()))
+
+        conn.close()
+        return _active
+    except Exception as e:
+        logger.error("Load weather: %s", e)
+    return False
 
 
 # ── Sheets ───────────────────────────────────────────────
@@ -512,43 +500,6 @@ def _log_trade(pos, result, pnl):
     threading.Thread(target=_w, daemon=True).start()
 
 
-# ── Persistence ──────────────────────────────────────────
-
-def _save_state():
-    from config import DB_PATH
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("CREATE TABLE IF NOT EXISTS weather_trader (key TEXT PRIMARY KEY, value TEXT)")
-        c.execute("INSERT OR REPLACE INTO weather_trader VALUES (?,?)",
-                  ("state", json.dumps({"active": _active, **_stats})))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error("Save weather: %s", e)
-
-
-def _load_state():
-    from config import DB_PATH
-    global _active
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("CREATE TABLE IF NOT EXISTS weather_trader (key TEXT PRIMARY KEY, value TEXT)")
-        row = c.execute("SELECT value FROM weather_trader WHERE key='state'").fetchone()
-        conn.close()
-        if row:
-            s = json.loads(row[0])
-            _active = s.get("active", False)
-            for k in _stats:
-                _stats[k] = s.get(k, 0)
-            _stats["started_at"] = int(time.time())
-            return _active
-    except Exception as e:
-        logger.error("Load weather: %s", e)
-    return False
-
-
 # ── Control ──────────────────────────────────────────────
 
 def start_weather():
@@ -556,7 +507,6 @@ def start_weather():
     _active = True
     _stats["started_at"] = int(time.time())
     _save_state()
-
 
 def stop_weather():
     global _active
@@ -568,31 +518,33 @@ def stop_weather():
     _positions.clear()
     _save_state()
 
-
 def is_weather_active():
     return _active
-
 
 def get_weather_status():
     if not _active:
         return "🌤 Weather Trader: OFF"
     w, l = _stats["wins"], _stats["losses"]
-    total = w + l
-    wr = (w / total * 100) if total > 0 else 0
+    total = _stats["total_trades"]
     sign = "+" if _stats["total_pnl"] >= 0 else ""
     hours = (int(time.time()) - _stats.get("started_at", int(time.time()))) // 3600
 
     pt = ""
     for ck, p in _positions.items():
         c = CITIES.get(ck, {})
-        st = "✅" if p.filled else "⏳"
+        if p.switching:
+            st = "🔄 Switching"
+        elif p.filled:
+            st = "✅ Holding"
+        else:
+            st = "⏳ Pending"
         pt += (f"\n\n🌡 <b>{c.get('name', ck)}</b> {p.target_date}\n"
-               f"  {p.temp_c}°C @ {p.buy_price*100:.0f}¢ {st}\n"
+               f"  {p.temp_c}°C @ {p.buy_price*100:.0f}¢ | {st}\n"
                f"  📌 {p.outcome[:40]}")
     if not pt:
         pt = "\n\n💤 Шукаю ринки..."
 
     return (f"🌤 <b>Weather Trader 🟢 ON</b>\n\n"
-            f"📈 {total}T | {w}W/{l}L ({wr:.0f}%)\n"
-            f"💰 {sign}${_stats['total_pnl']:.2f} | 🔄 {_stats['switches']} switches\n"
-            f"⏱ {hours}h\n📡 Open-Meteo" + pt)
+            f"📈 {total} trades | 🔄 {_stats['switches']} switches\n"
+            f"💰 {sign}${_stats['total_pnl']:.2f}\n"
+            f"⏱ {hours}h | 📡 Open-Meteo" + pt)
