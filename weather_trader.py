@@ -120,6 +120,11 @@ def find_weather_market(city_key: str) -> dict | None:
                     if m.get("closed"):
                         continue
                     cids = m.get("clobTokenIds", [])
+                    if isinstance(cids, str):
+                        try:
+                            cids = json.loads(cids)
+                        except Exception:
+                            cids = []
                     prices = m.get("outcomePrices", "")
                     try:
                         if isinstance(prices, str):
@@ -177,6 +182,11 @@ def find_weather_market(city_key: str) -> dict | None:
                                 pass
 
                         cids = m.get("clobTokenIds", [])
+                        if isinstance(cids, str):
+                            try:
+                                cids = json.loads(cids)
+                            except Exception:
+                                cids = []
                         prices = m.get("outcomePrices", "")
                         try:
                             if isinstance(prices, str):
@@ -225,6 +235,11 @@ def find_weather_market_by_event_slug(event_slug: str, target_date: str) -> dict
                 if m.get("closed"):
                     continue
                 cids = m.get("clobTokenIds", [])
+                if isinstance(cids, str):
+                    try:
+                        cids = json.loads(cids)
+                    except Exception:
+                        cids = []
                 prices = m.get("outcomePrices", "")
                 try:
                     if isinstance(prices, str):
