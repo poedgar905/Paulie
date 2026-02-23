@@ -96,7 +96,9 @@ def find_weather_market(city_key: str) -> dict | None:
             d = now_utc + timedelta(days=delta)
             month = d.strftime("%B").lower()
             day = d.day
-            slug = f"{city['slug_pattern']}{month}-{day}"
+            year = d.year
+            # Format: highest-temperature-in-london-on-february-23-2026
+            slug = f"{city['slug_pattern']}{month}-{day}-{year}"
             slugs_to_try.append((slug, d.strftime("%Y-%m-%d")))
 
         for slug, target_date in slugs_to_try:
