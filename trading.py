@@ -63,6 +63,54 @@ def get_balance() -> float | None:
     return None
 
 
+def get_conditional_balance(token_id: str) -> float | None:
+    """Get real conditional token (shares) balance on-chain."""
+    try:
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        client = _get_client()
+        if not client:
+            return None
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.CONDITIONAL,
+            token_id=token_id,
+        )
+        resp = client.get_balance_allowance(params)
+        if resp and "balance" in resp:
+            # Balance is in raw units (6 decimals for USDC-based)
+            raw = float(resp["balance"])
+            return raw / 1e6
+    except Exception as e:
+        logger.error("Error getting conditional balance: %s", e)
+    return None
+
+
+def debug_balance_info(token_id: str) -> str:
+    """Get full debug info about balance and allowances for a token."""
+    try:
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        client = _get_client()
+        if not client:
+            return "Client not initialized"
+
+        # Check USDC balance
+        usdc_params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        usdc = client.get_balance_allowance(usdc_params)
+
+        # Check conditional token balance
+        cond_params = BalanceAllowanceParams(
+            asset_type=AssetType.CONDITIONAL,
+            token_id=token_id,
+        )
+        cond = client.get_balance_allowance(cond_params)
+
+        return (
+            f"USDC: {usdc}\n"
+            f"Conditional ({token_id[:20]}...): {cond}"
+        )
+    except Exception as e:
+        return f"Debug error: {e}"
+
+
 def get_token_id_for_market(condition_id: str, outcome: str) -> str | None:
     """Resolve condition_id + outcome to a CLOB token_id via Gamma API."""
     try:
