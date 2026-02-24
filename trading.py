@@ -154,13 +154,14 @@ def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_i
         if size * price < 1.05:
             size = math.ceil(1.05 / price * 100) / 100
 
-        # Check neg_risk first — min 5 shares on neg_risk markets
+        # Check neg_risk first
         neg_risk = False
         if condition_id:
             neg_risk = get_neg_risk(condition_id)
 
-        if neg_risk and size < 5:
-            size = 5.0  # Polymarket minimum for neg_risk markets
+        # Polymarket requires minimum 5 shares for ALL markets
+        if size < 5:
+            size = 5.0
 
         # Round price to valid tick (0.01)
         price = round(price, 2)
@@ -213,8 +214,10 @@ def place_limit_sell(token_id: str, price: float, size: float, condition_id: str
         price = round(price, 2)
         size = round(size, 2)
 
-        if size < 5:
-            size = 5.0  # Polymarket minimum for some markets
+        # Note: min 5 shares for NEW orders, but when selling existing
+        # position we sell exactly what we have. Polymarket allows selling
+        # any amount you own.
+        # Don't bump to 5 here — caller must handle min size
 
         order_args = OrderArgs(
             price=price,
