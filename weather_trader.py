@@ -287,6 +287,24 @@ async def _trade_city(bot, city_key: str):
             return
     forecast_c = fc["high_c"]
 
+    # ── Check market leader — if one outcome is >70%, trust market ─
+    market_leader = None
+    market_leader_price = 0
+    for o in market.get("outcomes", []):
+        if o["price_yes"] > market_leader_price:
+            market_leader_price = o["price_yes"]
+            market_leader = o
+
+    if market_leader and market_leader_price >= 0.70:
+        # Market already knows the answer — extract temp from leader
+        nums = re.findall(r'(\d+)\s*°', market_leader["question"])
+        if nums:
+            market_temp = int(nums[0])
+            if market_temp != forecast_c:
+                logger.info("Market leader %d°C (%.0f%%) overrides forecast %d°C",
+                            market_temp, market_leader_price * 100, forecast_c)
+                forecast_c = market_temp
+
     # ── Match outcome ─────────────────────────────────
     outcome = match_outcome(market, forecast_c)
     if not outcome or not outcome["token_yes"]:
@@ -400,7 +418,11 @@ async def _trade_city(bot, city_key: str):
     mid = fetch_midprice(token)
     if not mid:
         mid = outcome.get("price_yes", 0)
-    if not mid or mid > 0.90:
+    if not mid or mid > 0.85:
+        logger.info("Skip %d°C: price %.0f¢ too high", forecast_c, (mid or 0)*100)
+        return
+    if mid < 0.03:
+        logger.info("Skip %d°C: price %.0f¢ too low (likely wrong)", forecast_c, mid*100)
         return
 
     buy_price = round(max(min(mid + 0.02, 0.90), 0.05), 2)
