@@ -374,7 +374,11 @@ async def _trade_city(bot, city_key: str):
 
     buy_price = round(max(min(mid + 0.02, 0.90), 0.05), 2)
 
-    result = place_limit_buy(token, buy_price, 1.0, cid)
+    # Need min 5 shares. At buy_price, cost = 5 * buy_price
+    # Send enough USDC for 5 shares
+    amount_usdc = round(5.0 * buy_price + 0.10, 2)  # +10¢ buffer
+
+    result = place_limit_buy(token, buy_price, amount_usdc, cid)
     if not result or not result.get("order_id"):
         return
 
