@@ -230,11 +230,16 @@ async def weather_checker(bot):
 
 async def _trade_city(bot, city_key: str):
     from trading import place_limit_buy, place_limit_sell, cancel_order, check_order_status
+    from trading import get_conditional_balance, debug_balance_info
     from sniper import fetch_midprice
 
     city = CITIES[city_key]
     now = int(time.time())
     pos = _positions.get(city_key)
+
+    # Throttle: if position has recent last_check, skip
+    if pos and now - pos.last_check < 4:
+        return
 
     # ── Find market ───────────────────────────────────
     market = find_weather_market(city_key)
@@ -309,21 +314,42 @@ async def _trade_city(bot, city_key: str):
             if not mid or mid < 0.02:
                 mid = 0.02
 
-            sell_price = round(max(mid - 0.01, 0.01), 2)
+            sell_price = round(max(mid - 0.02, 0.01), 2)
+
+            # Get REAL balance from chain — don't trust stored shares
+            real_balance = get_conditional_balance(pos.token_id)
+            if real_balance and real_balance > 0:
+                sell_size = round(real_balance, 2)
+                logger.info("Real balance: %s shares (stored: %s)", real_balance, pos.shares)
+            else:
+                # Fallback: sell 90% of stored shares
+                sell_size = round(pos.shares * 0.90, 2)
+                logger.warning("Could not get real balance, using 90%%: %s", sell_size)
+
+            if sell_size < 0.1:
+                sell_size = 0.1
+
+            # Log debug info
+            dbg = debug_balance_info(pos.token_id)
+            logger.info("SELL debug: %s", dbg)
+
+            logger.info("SELL attempt: token=%s price=%s size=%s (had %s)",
+                        pos.token_id[:20], sell_price, sell_size, pos.shares)
+
             sell_res = place_limit_sell(
-                pos.token_id, sell_price, pos.shares, pos.condition_id)
+                pos.token_id, sell_price, sell_size, pos.condition_id)
 
             if sell_res and sell_res.get("order_id"):
                 # Check if instant fill
                 resp = sell_res.get("response", {})
                 if resp.get("status") == "matched":
-                    pnl = round(pos.shares * sell_price - pos.cost, 4)
+                    pnl = round(sell_size * sell_price - pos.cost, 4)
                     _stats["switches"] += 1
                     _stats["total_pnl"] += pnl
                     await _notify(bot,
                         f"🔄 <b>SWITCH SOLD</b> | {city['name']}\n"
                         f"🌡 {old}°C → {forecast_c}°C\n"
-                        f"💰 Sold @ {sell_price*100:.0f}¢ (P&L: ${pnl:+.2f})")
+                        f"💰 Sold {sell_size} sh @ {sell_price*100:.0f}¢ (P&L: ${pnl:+.2f})")
                     del _positions[city_key]
                     pos = None
                 else:
@@ -333,14 +359,19 @@ async def _trade_city(bot, city_key: str):
                     await _notify(bot,
                         f"🔄 <b>SWITCH SELLING</b> | {city['name']}\n"
                         f"🌡 {old}°C → {forecast_c}°C\n"
-                        f"📤 Sell limit @ {sell_price*100:.0f}¢ pending...")
+                        f"📤 Sell limit {sell_size} sh @ {sell_price*100:.0f}¢ pending...")
                     _save_state()
                     return  # Don't enter new position yet
             else:
+                # Sell failed — don't spam, mark and skip for 60s
                 logger.error("Switch sell failed for %s", city_key)
-                await _notify(bot,
-                    f"⚠️ <b>SWITCH SELL FAIL</b> | {city['name']}\n"
-                    f"🌡 Tried {old}°C → {forecast_c}°C")
+                pos.last_check = now + 55  # skip next 55 seconds
+                if not hasattr(pos, '_sell_fail_notified'):
+                    pos._sell_fail_notified = True
+                    await _notify(bot,
+                        f"⚠️ <b>SWITCH SELL FAIL</b> | {city['name']}\n"
+                        f"🌡 Tried {old}°C → {forecast_c}°C\n"
+                        f"Will retry in 60s")
                 return
 
     # If position is in switching state, check if sell filled
