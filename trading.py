@@ -246,97 +246,77 @@ def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_i
 
 def place_limit_sell(token_id: str, price: float, size: float, condition_id: str = "") -> dict | None:
     """
-    Place a limit SELL order (GTC).
-    size = number of shares to sell.
-    price = price per share.
-    Automatically detects neg_risk markets (BTC up/down etc).
+    Place a limit SELL order via Node.js TypeScript CLOB client.
+    Python py-clob-client has a known bug with sell orders.
     """
-    client = _get_client()
-    if not client:
+    import subprocess, json, os
+
+    price = round(price, 2)
+    size = round(size, 2)
+
+    neg_risk = False
+    if condition_id:
+        neg_risk = get_neg_risk(condition_id)
+
+    # Find sell.js relative to this file
+    sell_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sell.js")
+    if not os.path.exists(sell_script):
+        logger.error("sell.js not found at %s", sell_script)
         return None
 
+    env = os.environ.copy()
+    env["PRIVATE_KEY"] = PRIVATE_KEY
+    env["FUNDER_ADDRESS"] = FUNDER_ADDRESS
+    env["SIGNATURE_TYPE"] = str(SIGNATURE_TYPE)
+
+    cmd = [
+        "node", sell_script,
+        token_id,
+        str(price),
+        str(size),
+        str(neg_risk).lower(),
+        "0.01",
+    ]
+
     try:
-        from py_clob_client.clob_types import OrderArgs, OrderType
-        from py_clob_client.order_builder.constants import SELL
-
-        price = round(price, 2)
-        size = round(size, 2)
-
-        # Note: min 5 shares for NEW orders, but when selling existing
-        # position we sell exactly what we have. Polymarket allows selling
-        # any amount you own.
-        # Don't bump to 5 here — caller must handle min size
-
-        order_args = OrderArgs(
-            price=price,
-            size=size,
-            side=SELL,
-            token_id=token_id,
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30, env=env
         )
+        output = result.stdout.strip()
+        if not output:
+            logger.error("sell.js no output. stderr: %s", result.stderr[:500])
+            return None
 
-        neg_risk = False
-        if condition_id:
-            neg_risk = get_neg_risk(condition_id)
+        data = json.loads(output)
+        if data.get("error"):
+            logger.error("sell.js error: %s", data["error"])
+            return None
 
-        signed = client.create_order(order_args)
-        try:
-            resp = client.post_order(signed, orderType=OrderType.GTC, neg_risk=neg_risk)
-        except TypeError:
-            try:
-                resp = client.post_order(signed, OrderType.GTC, neg_risk=neg_risk)
-            except TypeError:
-                try:
-                    resp = client.post_order(signed, OrderType.GTC)
-                except TypeError:
-                    resp = client.post_order(signed)
-        logger.info("SELL GTC order: price=%s size=%s neg_risk=%s resp=%s", price, size, neg_risk, resp)
-        return {"order_id": resp.get("orderID", ""), "price": price, "size": size, "response": resp}
+        logger.info("SELL via Node.js: price=%s size=%s neg_risk=%s resp=%s",
+                     price, size, neg_risk, data)
+        return {
+            "order_id": data.get("order_id", ""),
+            "price": price,
+            "size": size,
+            "response": data.get("response", {}),
+        }
 
+    except subprocess.TimeoutExpired:
+        logger.error("sell.js timed out (30s)")
+        return None
+    except json.JSONDecodeError as e:
+        logger.error("sell.js invalid JSON: %s | output: %s", e, output[:200])
+        return None
     except Exception as e:
-        logger.error("Error placing SELL order: %s", e)
+        logger.error("sell.js failed: %s", e)
         return None
 
 
 def place_market_sell(token_id: str, size: float, condition_id: str = "") -> dict | None:
     """
-    Place a market SELL order (FOK) — immediate execution.
-    Used for auto-sell when tracked trader sells, and for stop-loss.
+    Market sell = limit sell at very low price (1¢) for instant fill.
     """
-    client = _get_client()
-    if not client:
-        return None
-
-    try:
-        from py_clob_client.clob_types import MarketOrderArgs, OrderType
-        from py_clob_client.order_builder.constants import SELL
-
-        size = round(size, 2)
-
-        mo = MarketOrderArgs(
-            token_id=token_id,
-            amount=size,
-            side=SELL,
-        )
-
-        # Check neg_risk
-        neg_risk = False
-        if condition_id:
-            neg_risk = get_neg_risk(condition_id)
-
-        signed = client.create_market_order(mo)
-        try:
-            resp = client.post_order(signed, OrderType.FOK, neg_risk=neg_risk)
-        except TypeError:
-            try:
-                resp = client.post_order(signed, OrderType.FOK)
-            except TypeError:
-                resp = client.post_order(signed)
-        logger.info("Market SELL executed: size=%s neg_risk=%s resp=%s", size, neg_risk, resp)
-        return {"order_id": resp.get("orderID", ""), "size": size, "response": resp}
-
-    except Exception as e:
-        logger.error("Error placing market SELL: %s", e)
-        return None
+    return place_limit_sell(token_id, 0.01, size, condition_id)
 
 
 def check_order_status(order_id: str) -> str | None:
