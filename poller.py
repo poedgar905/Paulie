@@ -178,28 +178,22 @@ def compute_pnl(buys: list[dict], sell_trade: dict) -> dict | None:
 def calc_autocopy_amount(trader_usdc: float, trader_address: str, price: float = 0) -> float | None:
     """
     Calculate how much to spend based on trader's trade size.
-    < $1  → copy exact amount
-    $2-$10 → $1
-    $10-$20 → $2
-    $20-$50 → $3
-    $50+ → $5 (max 1x per day)
-    If 5-share minimum costs more than calculated amount, use 5*price instead.
+    < $1   → copy exact amount (as-is)
+    $1-$2  → copy exact amount (as-is)
+    $2-$10 → $2
+    $10-$50 → $3
+    $50+   → $5 (max bet)
     Returns None if should skip.
     """
     if trader_usdc < 1.0:
         amount = trader_usdc
-    elif trader_usdc < 2.0:
-        amount = 1.0
-    elif trader_usdc < 10.0:
-        amount = 1.0
-    elif trader_usdc < 20.0:
+    elif trader_usdc <= 2.0:
+        amount = trader_usdc
+    elif trader_usdc <= 10.0:
         amount = 2.0
-    elif trader_usdc < 50.0:
+    elif trader_usdc <= 50.0:
         amount = 3.0
     else:
-        count = get_daily_big_trade_count(trader_address)
-        if count >= 1:
-            return None
         amount = 5.0
 
     return amount
