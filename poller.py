@@ -531,9 +531,21 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
             f"👤 Copying: {trader_name} ({_usd(trader_usdc)})"
         )
     else:
+        # Get diagnostic info
+        from trading import get_balance, debug_balance_info
+        bal = get_balance()
+        diag = ""
+        if token_id:
+            diag = debug_balance_info(token_id)
         await bot.send_message(
             chat_id=OWNER_ID,
-            text=f"⚠️ <b>Autocopy FAILED</b> for {title}\nCheck balance/allowances.",
+            text=(
+                f"⚠️ <b>Autocopy FAILED</b>\n"
+                f"📌 {title}\n"
+                f"🎯 {outcome} @ {_price(price)} | ${amount:.2f}\n"
+                f"💰 Balance: ${bal:.2f if bal else '?'}\n"
+                f"🔧 {diag[:200] if diag else 'no diag'}"
+            ),
             parse_mode=ParseMode.HTML,
         )
 
@@ -555,61 +567,91 @@ async def _auto_sell_copies(bot: Bot, trader_address: str, condition_id: str, ou
 
     sell_price = float(sell_trade.get("price", 0))
     sell_ts = int(sell_trade.get("timestamp", time.time()))
+    trader_sell_shares = float(sell_trade.get("size", 0))
+
+    # Calculate what fraction of his position the trader is selling
+    trader_buys = find_all_open_buys(trader_address, condition_id, outcome)
+    trader_total_shares = sum(float(b.get("size", 0)) for b in trader_buys) if trader_buys else 0
+
+    if trader_total_shares <= 0 or trader_sell_shares >= trader_total_shares * 0.95:
+        sell_fraction = 1.0
+    else:
+        sell_fraction = min(trader_sell_shares / trader_total_shares, 1.0)
+
+    logger.info("Autocopy sell: trader sells %.1f/%.1f (%.0f%%)",
+                trader_sell_shares, trader_total_shares, sell_fraction * 100)
 
     for copy in copies:
         try:
             token_id = copy["token_id"]
-            shares = float(copy["shares"])
+            total_shares = float(copy["shares"])
             invested = float(copy["usdc_spent"])
 
-            result = place_market_sell(token_id, shares, condition_id)
+            shares_to_sell = round(total_shares * sell_fraction, 2)
+            if shares_to_sell < 0.1:
+                shares_to_sell = total_shares
+
+            result = place_market_sell(token_id, shares_to_sell, condition_id)
 
             if result:
-                sell_usdc = shares * sell_price
-                pnl_usdc = sell_usdc - invested
-                pnl_pct = (pnl_usdc / invested * 100) if invested > 0 else 0
+                sell_usdc = shares_to_sell * sell_price
+                cost_fraction = invested * sell_fraction
+                pnl_usdc = sell_usdc - cost_fraction
+                pnl_pct = (pnl_usdc / cost_fraction * 100) if cost_fraction > 0 else 0
 
-                close_copy_trade(copy["id"], sell_price, sell_usdc, sell_ts,
-                               pnl_usdc=pnl_usdc, pnl_pct=pnl_pct)
+                if sell_fraction >= 0.95:
+                    close_copy_trade(copy["id"], sell_price, sell_usdc, sell_ts,
+                                   pnl_usdc=pnl_usdc, pnl_pct=pnl_pct)
+                    action = "SOLD ALL"
+                else:
+                    remaining_shares = round(total_shares - shares_to_sell, 2)
+                    remaining_cost = round(invested - cost_fraction, 2)
+                    _update_copy_partial_sell(copy["id"], remaining_shares, remaining_cost)
+                    action = f"SOLD {sell_fraction*100:.0f}%"
 
                 sign = "+" if pnl_usdc >= 0 else ""
                 emoji = "🟩" if pnl_usdc >= 0 else "🟥"
                 hold = _duration(sell_ts - int(copy["timestamp"]))
-                source = "AUTOCOPY" if copy.get("source") == "autocopy" else "COPY"
 
                 msg = (
-                    f"🤖 <b>AUTO-SOLD</b> ({source})\n\n"
+                    f"🤖 <b>AUTO-{action}</b>\n\n"
                     f"📌 <b>{copy.get('title', '?')}</b>\n"
                     f"🎯 {outcome} @ {_price(sell_price)}\n"
-                    f"💵 {_usd(sell_usdc)} ({_shares(shares)} shares)\n"
-                    f"👤 Trader: {trader_name}\n\n"
-                    f"📊 <b>Your P&L:</b>\n"
-                    f"   Entry: {_price(copy['buy_price'])} → Exit: {_price(sell_price)}\n"
+                    f"💵 {_usd(sell_usdc)} ({_shares(shares_to_sell)} sh)\n"
+                    f"👤 Trader: {trader_name} sold {_shares(trader_sell_shares)}/{_shares(trader_total_shares)}\n\n"
+                    f"📊 <b>P&L:</b>\n"
+                    f"   {_price(copy['buy_price'])} → {_price(sell_price)}\n"
                     f"   {emoji} {sign}{_usd(pnl_usdc)} ({sign}{pnl_pct:.1f}%)\n"
-                    f"   ⏳ Held: {hold}"
+                    f"   ⏳ {hold}"
                 )
                 await bot.send_message(chat_id=OWNER_ID, text=msg, parse_mode=ParseMode.HTML)
-                # Forward to channel
                 await _send_to_channel(bot, msg)
             else:
-                # Sell failed — likely ghost trade (never filled or already sold)
-                # Close it in DB so it doesn't spam again
-                close_copy_trade(copy["id"], sell_price, 0, sell_ts,
-                               pnl_usdc=-invested, pnl_pct=-100)
-                logger.warning(f"Auto-sell failed for {copy.get('title', '?')}, closing ghost trade in DB")
+                logger.warning(f"Auto-sell failed for {copy.get('title', '?')}")
                 await bot.send_message(
                     chat_id=OWNER_ID,
                     text=(
                         f"⚠️ <b>Auto-sell FAILED</b>\n"
                         f"📌 {copy.get('title', '?')[:50]}\n"
-                        f"💵 {_usd(invested)} ({_shares(shares)} shares)\n"
-                        f"❌ Закрив запис в БД (шейрів скоріш за все нема)\n"
                         f"👉 Перевір позицію на polymarket.com"
                     ),
                     parse_mode=ParseMode.HTML,
                 )
         except Exception as e:
             logger.error(f"Auto-sell error: {e}")
+
+
+def _update_copy_partial_sell(copy_id: int, remaining_shares: float, remaining_cost: float):
+    """Update copy trade after partial sell — keep it OPEN with reduced size."""
+    from config import DB_PATH
+    import sqlite3
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE copy_trades SET shares = ?, usdc_spent = ? WHERE id = ?",
+        (remaining_shares, remaining_cost, copy_id)
+    )
+    conn.commit()
+    conn.close()
 
 
 # ── Cancel PENDING orders when trader exits ──────────────────────
