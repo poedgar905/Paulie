@@ -509,52 +509,57 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /cleanup ───────────────────────────────────────────────────
 @owner_only
 async def cleanup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel live orders, clean ghost trades."""
+    """Cancel live PENDING orders, verify OPEN positions. Never deletes OPEN trades."""
     from trading import check_order_status, cancel_order
     from database import get_all_pending_copy_trades, update_copy_trade_status
 
-    # Clean OPEN trades
-    copies = get_all_open_copy_trades()
+    # Only clean PENDING trades (not yet filled)
     pending = get_all_pending_copy_trades()
-    all_trades = copies + pending
+    copies = get_all_open_copy_trades()
 
-    if not all_trades:
+    if not pending and not copies:
         await update.message.reply_text("✅ Нема відкритих/pending копі-трейдів.")
         return
 
-    msg = await update.message.reply_text(f"🧹 Перевіряю {len(all_trades)} позицій...")
+    msg = await update.message.reply_text(
+        f"🧹 Перевіряю {len(pending)} pending + {len(copies)} open...")
 
     cleaned = 0
     cancelled = 0
-    real_positions = 0
+    confirmed = 0
 
-    for c in all_trades:
+    # Process PENDING trades — these can be cleaned
+    for c in pending:
         order_id = c.get("order_id", "")
-        current_status = c.get("status", "OPEN")
-
         if order_id:
             status = check_order_status(order_id)
             status_lower = status.lower() if status else ""
 
             if status_lower == "matched":
-                if current_status == "PENDING":
-                    update_copy_trade_status(c["id"], "OPEN")
-                real_positions += 1
+                update_copy_trade_status(c["id"], "OPEN")
+                confirmed += 1
             elif status_lower == "live":
                 cancel_order(order_id)
                 update_copy_trade_status(c["id"], "CANCELLED")
                 cancelled += 1
             else:
-                close_copy_trade(c["id"], 0, 0, int(time.time()), pnl_usdc=0, pnl_pct=0)
+                # Not matched, not live → ghost pending
+                update_copy_trade_status(c["id"], "CANCELLED")
                 cleaned += 1
         else:
-            real_positions += 1
+            # No order_id → ghost
+            update_copy_trade_status(c["id"], "CANCELLED")
+            cleaned += 1
+
+    # OPEN trades — NEVER delete, just report
+    open_count = len(copies)
 
     await msg.edit_text(
         f"🧹 <b>Cleanup done!</b>\n\n"
-        f"✅ Реальні позиції: {real_positions}\n"
-        f"❌ Скасовано ліміток: {cancelled}\n"
-        f"🗑 Видалено привидів: {cleaned}",
+        f"✅ Open позиції (не чіпав): {open_count}\n"
+        f"✅ Pending → підтверджено: {confirmed}\n"
+        f"❌ Pending → скасовано: {cancelled}\n"
+        f"🗑 Pending → привиди: {cleaned}",
         parse_mode=ParseMode.HTML,
     )
 
