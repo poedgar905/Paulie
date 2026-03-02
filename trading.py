@@ -322,71 +322,87 @@ def _auto_set_allowances():
 
 def place_limit_sell(token_id: str, price: float, size: float, condition_id: str = "") -> dict | None:
     """
-    Place a limit SELL order via Node.js TypeScript CLOB client.
-    Python py-clob-client has a known bug with sell orders.
+    Place a limit SELL order via Python py-clob-client.
+    Uses same client as BUY — credentials already working.
     """
-    import subprocess, json, os
-
-    price = round(price, 2)
-    size = round(size, 2)
-
-    neg_risk = False
-    if condition_id:
-        neg_risk = get_neg_risk(condition_id)
-
-    # Find sell.js relative to this file
-    sell_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sell.js")
-    if not os.path.exists(sell_script):
-        logger.error("sell.js not found at %s", sell_script)
+    client = _get_client()
+    if not client:
         return None
-
-    env = os.environ.copy()
-    env["PRIVATE_KEY"] = PRIVATE_KEY
-    env["FUNDER_ADDRESS"] = FUNDER_ADDRESS
-    env["SIGNATURE_TYPE"] = str(SIGNATURE_TYPE)
-
-    cmd = [
-        "node", sell_script,
-        token_id,
-        str(price),
-        str(size),
-        str(neg_risk).lower(),
-        "0.01",
-    ]
 
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30, env=env
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.order_builder.constants import SELL
+
+        price = round(price, 2)
+        size = round(size, 2)
+
+        if size < 0.1:
+            logger.error("Sell size too small: %s", size)
+            return None
+
+        if price <= 0 or price >= 1:
+            logger.error("Invalid sell price: %s", price)
+            return None
+
+        neg_risk = False
+        if condition_id:
+            neg_risk = get_neg_risk(condition_id)
+
+        logger.info("SELL attempt: token=%s price=%s size=%s neg_risk=%s",
+                     token_id[:30], price, size, neg_risk)
+
+        order_args = OrderArgs(
+            price=price,
+            size=size,
+            side=SELL,
+            token_id=token_id,
         )
-        output = result.stdout.strip()
-        if not output:
-            logger.error("sell.js no output. stderr: %s", result.stderr[:500])
+
+        signed = client.create_order(order_args)
+
+        # Try posting with different signatures (same pattern as buy)
+        resp = None
+        try:
+            resp = client.post_order(signed, orderType=OrderType.GTC, neg_risk=neg_risk)
+        except TypeError:
+            try:
+                resp = client.post_order(signed, OrderType.GTC, neg_risk=neg_risk)
+            except TypeError:
+                try:
+                    resp = client.post_order(signed, OrderType.GTC)
+                except TypeError:
+                    resp = client.post_order(signed)
+
+        logger.info("SELL order resp: %s", resp)
+
+        if resp and resp.get("orderID"):
+            return {
+                "order_id": resp.get("orderID", ""),
+                "price": price,
+                "size": size,
+                "response": resp,
+            }
+
+        # Check if it's an error response
+        if resp and resp.get("error"):
+            logger.error("SELL error: %s", resp["error"])
             return None
 
-        data = json.loads(output)
-        if data.get("error"):
-            logger.error("sell.js error: %s", data["error"])
-            return None
+        # Even without orderID, if status is matched it worked
+        if resp and resp.get("status") == "matched":
+            return {
+                "order_id": resp.get("orderID", ""),
+                "price": price,
+                "size": size,
+                "response": resp,
+            }
 
-        logger.info("SELL via Node.js: price=%s size=%s neg_risk=%s resp=%s",
-                     price, size, neg_risk, data)
-        return {
-            "order_id": data.get("order_id", ""),
-            "price": price,
-            "size": size,
-            "response": data.get("response", {}),
-        }
+        logger.error("SELL unexpected response: %s", resp)
+        return None
 
-    except subprocess.TimeoutExpired:
-        logger.error("sell.js timed out (30s)")
-        return None
-    except json.JSONDecodeError as e:
-        logger.error("sell.js invalid JSON: %s | output: %s", e, output[:200])
-        return None
     except Exception as e:
-        logger.error("sell.js failed: %s", e)
+        logger.error("Error placing SELL order: %s", e)
         return None
-
 
 def place_market_sell(token_id: str, size: float, condition_id: str = "") -> dict | None:
     """
