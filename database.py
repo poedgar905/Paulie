@@ -536,3 +536,30 @@ def get_copy_trades_by_hashtag() -> list[dict]:
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def find_open_copy_trades_by_token(trader_address: str, token_id: str) -> list[dict]:
+    """Find OPEN copy trades matching exact token_id — prevents cross-market confusion."""
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT * FROM copy_trades
+           WHERE trader_address = ? AND token_id = ? AND status = 'OPEN'""",
+        (trader_address.lower(), token_id)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def has_trader_sold_token(trader_address: str, token_id: str) -> bool:
+    """Check if trader sold this exact token (not just same outcome name)."""
+    conn = get_db()
+    row = conn.execute(
+        """SELECT COUNT(*) as cnt FROM seen_trades
+           WHERE trader_address = ? AND side = 'SELL'
+           AND condition_id IN (
+               SELECT condition_id FROM buy_messages WHERE token_id = ? AND trader_address = ?
+           )""",
+        (trader_address.lower(), token_id, trader_address.lower())
+    ).fetchone()
+    conn.close()
+    return row["cnt"] > 0 if row else False
