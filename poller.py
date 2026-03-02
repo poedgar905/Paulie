@@ -12,7 +12,7 @@ from config import OWNER_ID, POLL_INTERVAL, CHANNEL_ID
 from database import (
     get_all_traders, is_trade_seen, mark_trade_seen,
     save_buy_message, find_buy_message, find_all_open_buys, close_buy_messages,
-    find_open_copy_trades, close_copy_trade, save_copy_trade,
+    find_open_copy_trades, find_open_copy_trades_by_token, close_copy_trade, save_copy_trade,
     get_display_name, get_daily_big_trade_count, increment_daily_big_trade,
 )
 from polymarket_api import get_activity, detect_order_type
@@ -43,6 +43,10 @@ def _url(trade: dict) -> str:
         return f"https://polymarket.com/event/{es}/{s}"
     return f"https://polymarket.com/event/{es or s}" if (es or s) else "https://polymarket.com"
 
+def _esc(text: str) -> str:
+    """Escape HTML special chars for Telegram."""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 def _price(p) -> str:
     try: return f"{float(p) * 100:.1f}¢"
     except: return str(p)
@@ -71,8 +75,8 @@ def _duration(secs: int) -> str:
 # ── Message formatters ───────────────────────────────────────────
 
 def format_buy_message(trade: dict, display_name: str, order_type: str = "❓", hashtag: str = "") -> str:
-    title = trade.get("title", "Unknown Market")
-    outcome = trade.get("outcome", "?")
+    title = _esc(trade.get("title", "Unknown Market"))
+    outcome = _esc(trade.get("outcome", "?"))
     price = trade.get("price", 0)
     size = trade.get("size", 0)
     usdc = trade.get("usdcSize", 0)
@@ -94,8 +98,8 @@ def format_buy_message(trade: dict, display_name: str, order_type: str = "❓", 
 
 def format_sell_message(trade: dict, display_name: str, pnl: dict | None = None,
                         order_type: str = "❓", hashtag: str = "") -> str:
-    title = trade.get("title", "Unknown Market")
-    outcome = trade.get("outcome", "?")
+    title = _esc(trade.get("title", "Unknown Market"))
+    outcome = _esc(trade.get("outcome", "?"))
     price = trade.get("price", 0)
     size = trade.get("size", 0)
     usdc = trade.get("usdcSize", 0)
@@ -518,18 +522,11 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
                 f"🎯 BUY {outcome} @ {_price(price)}\n"
                 f"💵 {_usd(amount)} ({_shares(shares)} shares)\n"
                 f"👤 Trader put: {_usd(trader_usdc)}\n\n"
-                f"🤖 Will auto-sell when {trader_name} exits."
+                f"⏳ Order pending — channel post after fill"
             ),
             parse_mode=ParseMode.HTML,
         )
-        # Forward to channel
-        await _send_to_channel(bot,
-            f"🟢 <b>AUTOCOPY BUY</b>\n\n"
-            f"📌 <b>{title}</b>\n"
-            f"🎯 {outcome} @ {_price(price)}\n"
-            f"💵 {_usd(amount)} ({_shares(shares)} shares)\n"
-            f"👤 Copying: {trader_name} ({_usd(trader_usdc)})"
-        )
+        # DON'T post to channel yet — wait for FILLED confirmation in order_status_checker
     else:
         # Get diagnostic info
         from trading import get_balance, debug_balance_info
@@ -553,7 +550,15 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
 # ── Auto-sell copy trades ────────────────────────────────────────
 
 async def _auto_sell_copies(bot: Bot, trader_address: str, condition_id: str, outcome: str, sell_trade: dict):
-    copies = find_open_copy_trades(trader_address, condition_id, outcome)
+    """Auto-sell our copies when trader sells. Match by token_id to avoid cross-market confusion."""
+    token_id = sell_trade.get("asset", "")
+    if not token_id:
+        # Fallback to condition_id matching
+        copies = find_open_copy_trades(trader_address, condition_id, outcome)
+    else:
+        # Match by exact token_id — prevents selling wrong market
+        copies = find_open_copy_trades_by_token(trader_address, token_id)
+
     if not copies:
         return
 
@@ -679,7 +684,7 @@ async def check_pending_orders(bot: Bot):
     """
     from database import (
         get_all_pending_copy_trades, update_copy_trade_status,
-        has_trader_sold, get_all_traders,
+        has_trader_sold, has_trader_sold_token, get_all_traders,
     )
     from trading import check_order_status, cancel_order
 
@@ -718,9 +723,18 @@ async def check_pending_orders(bot: Bot):
                         parse_mode=ParseMode.HTML,
                     )
 
-                    # Check if trader already sold this market
-                    if has_trader_sold(p["trader_address"], p["condition_id"], p["outcome"]):
-                        logger.info("Trader already sold — auto-selling filled order")
+                    # NOW post to channel — only after confirmed fill
+                    await _send_to_channel(bot,
+                        f"🟢 <b>AUTOCOPY BUY</b>\n\n"
+                        f"📌 <b>{p.get('title', '?')}</b>\n"
+                        f"🎯 {p['outcome']} @ {_price(p['buy_price'])}\n"
+                        f"💵 {_usd(p['usdc_spent'])} ({_shares(p['shares'])} shares)\n"
+                        f"👤 Copying: {trader_name}"
+                    )
+
+                    # Check if trader already sold THIS EXACT token
+                    if has_trader_sold_token(p["trader_address"], p["token_id"]):
+                        logger.info("Trader already sold this token — auto-selling")
                         result = place_market_sell(p["token_id"], float(p["shares"]), p["condition_id"])
                         if result:
                             close_copy_trade(p["id"], 0, 0, int(time.time()), pnl_usdc=0, pnl_pct=0)
@@ -729,6 +743,16 @@ async def check_pending_orders(bot: Bot):
                                 text=(
                                     f"🤖 <b>AUTO-SOLD</b> (трейдер вже вийшов)\n"
                                     f"📌 {p.get('title', '?')[:50]}"
+                                ),
+                                parse_mode=ParseMode.HTML,
+                            )
+                        else:
+                            await bot.send_message(
+                                chat_id=OWNER_ID,
+                                text=(
+                                    f"⚠️ <b>AUTO-SELL FAILED</b>\n"
+                                    f"📌 {p.get('title', '?')[:50]}\n"
+                                    f"👉 Продай вручну на polymarket.com"
                                 ),
                                 parse_mode=ParseMode.HTML,
                             )
