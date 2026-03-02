@@ -217,6 +217,12 @@ def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_i
             logger.error("Invalid price: %s", price)
             return None
 
+        # Pre-check: log balance info for diagnostics
+        actual_cost = round(size * price, 2)
+        bal = get_balance()
+        logger.info("BUY pre-check: need $%.2f (%.1f sh × %.2f), USDC balance=$%s, neg_risk=%s",
+                     actual_cost, size, price, f"{bal:.2f}" if bal else "?", neg_risk)
+
         order_args = OrderArgs(
             price=price,
             size=size,
@@ -240,8 +246,78 @@ def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_i
         return {"order_id": resp.get("orderID", ""), "price": price, "size": size, "response": resp}
 
     except Exception as e:
+        error_str = str(e)
         logger.error("Error placing BUY order: %s", e)
+
+        # If allowance issue, try to set allowances automatically
+        if "allowance" in error_str.lower():
+            logger.warning("Allowance issue detected — running auto-approve...")
+            try:
+                _auto_set_allowances()
+                logger.info("Auto-approve done, retry buy on next cycle")
+            except Exception as ae:
+                logger.error("Auto-approve failed: %s", ae)
+
         return None
+
+
+def _auto_set_allowances():
+    """Automatically set all required allowances for trading."""
+    try:
+        from web3 import Web3
+        RPCS = [
+            "https://polygon-bor-rpc.publicnode.com",
+            "https://polygon.llamarpc.com",
+        ]
+        w3 = None
+        for rpc in RPCS:
+            try:
+                _w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 15}))
+                if _w3.is_connected():
+                    w3 = _w3
+                    break
+            except Exception:
+                continue
+        if not w3:
+            logger.error("Auto-approve: can't connect to RPC")
+            return
+
+        account = w3.eth.account.from_key(PRIVATE_KEY)
+        MAX_ALLOWANCE = 2**256 - 1
+
+        USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+        NEG_RISK_CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+
+        ERC20_ABI = [{"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},
+                     {"inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
+
+        usdc = w3.eth.contract(address=Web3.to_checksum_address(USDC_ADDRESS), abi=ERC20_ABI)
+
+        # Check current allowance first
+        for spender, label in [(CTF_EXCHANGE, "Exchange"), (NEG_RISK_CTF_EXCHANGE, "NegRisk")]:
+            current = usdc.functions.allowance(account.address, Web3.to_checksum_address(spender)).call()
+            logger.info("Current %s allowance: %s", label, current)
+            if current < 10**12:  # less than $1M allowance
+                nonce = w3.eth.get_transaction_count(account.address)
+                gas_price = int(w3.eth.gas_price * 1.5)
+                tx = usdc.functions.approve(
+                    Web3.to_checksum_address(spender), MAX_ALLOWANCE
+                ).build_transaction({
+                    "from": account.address,
+                    "nonce": nonce,
+                    "gas": 100000,
+                    "gasPrice": gas_price,
+                })
+                signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                logger.info("Auto-approve %s tx: %s", label, tx_hash.hex())
+                import time as _time
+                _time.sleep(5)
+
+        logger.info("Auto-approve complete")
+    except Exception as e:
+        logger.error("Auto-approve error: %s", e)
 
 
 def place_limit_sell(token_id: str, price: float, size: float, condition_id: str = "") -> dict | None:
