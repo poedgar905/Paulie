@@ -622,6 +622,17 @@ async def _auto_sell_copies(bot: Bot, trader_address: str, condition_id: str, ou
             if shares_to_sell < 0.1:
                 shares_to_sell = total_shares
 
+            # Check real balance before sell to avoid ghost trades
+            from trading import get_conditional_balance
+            real_bal = get_conditional_balance(token_id)
+            if real_bal is not None and real_bal < 0.1:
+                logger.warning("No shares for %s (bal=%.2f), closing ghost", _esc(copy.get("title", "?"))[:30], real_bal)
+                close_copy_trade(copy["id"], sell_price, 0, sell_ts, pnl_usdc=-invested, pnl_pct=-100)
+                continue
+            if real_bal is not None and real_bal < shares_to_sell:
+                shares_to_sell = round(real_bal, 2)
+                logger.info("Adjusted sell to real balance: %.2f", shares_to_sell)
+
             result = place_market_sell(token_id, shares_to_sell, condition_id)
 
             if result:
