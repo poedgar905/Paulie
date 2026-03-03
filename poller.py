@@ -514,6 +514,37 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
         logger.error("Autocopy: no token_id for %s", title)
         return
 
+    # Check available balance before buying
+    from trading import get_balance, get_open_orders, cancel_order
+    bal = get_balance()
+    if bal is not None and bal < amount:
+        # Not enough cash — cancel oldest live orders to free up funds
+        logger.warning("Low balance $%.2f < $%.2f needed, cancelling stale orders", bal, amount)
+        open_orders = get_open_orders()
+        cancelled = 0
+        for old_ord in sorted(open_orders, key=lambda x: x.get("timestamp", 0)):
+            oid = old_ord.get("id", "")
+            if oid and cancelled < 3:
+                try:
+                    cancel_order(oid)
+                    cancelled += 1
+                except Exception:
+                    pass
+        if cancelled > 0:
+            logger.info("Cancelled %d stale orders to free balance", cancelled)
+            import time as _t2
+            _t2.sleep(2)
+            bal = get_balance()
+
+    if bal is not None and bal < 1.0:
+        logger.warning("Balance too low ($%.2f), skipping autocopy", bal)
+        await bot.send_message(
+            chat_id=OWNER_ID,
+            text=f"⏭ <b>Autocopy skip</b> — баланс ${bal:.2f}, мало для копі",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     result = place_limit_buy(token_id, price, amount, condition_id)
 
     if result:
@@ -566,7 +597,7 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
                 f"⚠️ <b>Autocopy FAILED</b>\n"
                 f"📌 {title}\n"
                 f"🎯 {outcome} @ {_price(price)} | ${amount:.2f}\n"
-                f"💰 Balance: ${bal:.2f if bal else '?'}\n"
+                f"💰 Balance: ${bal:.2f}\n" if bal else f"💰 Balance: ?\n"
                 f"🔧 {diag[:200] if diag else 'no diag'}"
             ),
             parse_mode=ParseMode.HTML,
@@ -621,17 +652,6 @@ async def _auto_sell_copies(bot: Bot, trader_address: str, condition_id: str, ou
             shares_to_sell = round(total_shares * sell_fraction, 2)
             if shares_to_sell < 0.1:
                 shares_to_sell = total_shares
-
-            # Check real balance before sell to avoid ghost trades
-            from trading import get_conditional_balance
-            real_bal = get_conditional_balance(token_id)
-            if real_bal is not None and real_bal < 0.1:
-                logger.warning("No shares for %s (bal=%.2f), closing ghost", _esc(copy.get("title", "?"))[:30], real_bal)
-                close_copy_trade(copy["id"], sell_price, 0, sell_ts, pnl_usdc=-invested, pnl_pct=-100)
-                continue
-            if real_bal is not None and real_bal < shares_to_sell:
-                shares_to_sell = round(real_bal, 2)
-                logger.info("Adjusted sell to real balance: %.2f", shares_to_sell)
 
             result = place_market_sell(token_id, shares_to_sell, condition_id)
 
