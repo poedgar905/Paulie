@@ -24,14 +24,39 @@ logger = logging.getLogger(__name__)
 
 async def _send_to_channel(bot: Bot, text: str):
     """Send copy trade notification to the dedicated channel."""
+    if not CHANNEL_ID:
+        return
     try:
-        if CHANNEL_ID:
-            await bot.send_message(
-                chat_id=CHANNEL_ID, text=text,
-                parse_mode=ParseMode.HTML, disable_web_page_preview=True,
-            )
+        await bot.send_message(
+            chat_id=CHANNEL_ID, text=text,
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        )
     except Exception as e:
         logger.error(f"Channel send error: {e}")
+        try:
+            import re
+            clean = re.sub(r'<[^>]*>', '', text)
+            await bot.send_message(chat_id=CHANNEL_ID, text=clean, disable_web_page_preview=True)
+        except Exception:
+            pass
+
+
+async def _safe_send(bot: Bot, chat_id, text: str, **kwargs):
+    """Send HTML message, auto-escape if Telegram parse fails."""
+    try:
+        return await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, **kwargs)
+    except Exception as e:
+        err = str(e).lower()
+        if "parse entities" in err or "unsupported start tag" in err:
+            import re
+            # Escape all < that aren't valid HTML tags
+            clean = re.sub(r'<(?!/?(?:b|i|a|code|pre|s|u)\b)', '&lt;', text)
+            try:
+                return await bot.send_message(chat_id=chat_id, text=clean, parse_mode=ParseMode.HTML, **kwargs)
+            except Exception:
+                clean2 = re.sub(r'<[^>]*>', '', text)
+                return await bot.send_message(chat_id=chat_id, text=clean2, **kwargs)
+        raise
 
 
 # ── Formatting helpers ───────────────────────────────────────────
@@ -277,6 +302,7 @@ async def _send_notification(bot: Bot, trade: dict, address: str, display_name: 
     token_id = trade.get("asset", "")
     tx_hash = trade.get("transactionHash", "")
     title = trade.get("title", "")
+    title_safe = _esc(title)
 
     # Detect hashtag
     hashtag = detect_hashtag(title)
@@ -466,7 +492,7 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
     condition_id = trade.get("conditionId", "")
     outcome = trade.get("outcome", "?")
     token_id = trade.get("asset", "")
-    title = trade.get("title", "")
+    title = _esc(trade.get("title", ""))
 
     amount = calc_autocopy_amount(trader_usdc, trader_address, price)
     if amount is None:
@@ -620,7 +646,7 @@ async def _auto_sell_copies(bot: Bot, trader_address: str, condition_id: str, ou
 
                 msg = (
                     f"🤖 <b>AUTO-{action}</b>\n\n"
-                    f"📌 <b>{copy.get('title', '?')}</b>\n"
+                    f"📌 <b>{_esc(copy.get('title', '?'))}</b>\n"
                     f"🎯 {outcome} @ {_price(sell_price)}\n"
                     f"💵 {_usd(sell_usdc)} ({_shares(shares_to_sell)} sh)\n"
                     f"👤 Trader: {trader_name} sold {_shares(trader_sell_shares)}/{_shares(trader_total_shares)}\n\n"
@@ -632,12 +658,12 @@ async def _auto_sell_copies(bot: Bot, trader_address: str, condition_id: str, ou
                 await bot.send_message(chat_id=OWNER_ID, text=msg, parse_mode=ParseMode.HTML)
                 await _send_to_channel(bot, msg)
             else:
-                logger.warning(f"Auto-sell failed for {copy.get('title', '?')}")
+                logger.warning(f"Auto-sell failed for {_esc(copy.get('title', '?'))}")
                 await bot.send_message(
                     chat_id=OWNER_ID,
                     text=(
                         f"⚠️ <b>Auto-sell FAILED</b>\n"
-                        f"📌 {copy.get('title', '?')[:50]}\n"
+                        f"📌 {_esc(copy.get('title', '?'))[:50]}\n"
                         f"👉 Перевір позицію на polymarket.com"
                     ),
                     parse_mode=ParseMode.HTML,
@@ -716,7 +742,7 @@ async def check_pending_orders(bot: Bot):
                         chat_id=OWNER_ID,
                         text=(
                             f"✅ <b>Ордер заповнився!</b>\n"
-                            f"📌 {p.get('title', '?')[:50]}\n"
+                            f"📌 {_esc(p.get('title', '?'))[:50]}\n"
                             f"🎯 {p['outcome']} @ {_price(p['buy_price'])}\n"
                             f"💵 {_usd(p['usdc_spent'])} ({_shares(p['shares'])} shares)"
                         ),
@@ -726,7 +752,7 @@ async def check_pending_orders(bot: Bot):
                     # NOW post to channel — only after confirmed fill
                     await _send_to_channel(bot,
                         f"🟢 <b>AUTOCOPY BUY</b>\n\n"
-                        f"📌 <b>{p.get('title', '?')}</b>\n"
+                        f"📌 <b>{_esc(p.get('title', '?'))}</b>\n"
                         f"🎯 {p['outcome']} @ {_price(p['buy_price'])}\n"
                         f"💵 {_usd(p['usdc_spent'])} ({_shares(p['shares'])} shares)\n"
                         f"👤 Copying: {trader_name}"
@@ -742,7 +768,7 @@ async def check_pending_orders(bot: Bot):
                                 chat_id=OWNER_ID,
                                 text=(
                                     f"🤖 <b>AUTO-SOLD</b> (трейдер вже вийшов)\n"
-                                    f"📌 {p.get('title', '?')[:50]}"
+                                    f"📌 {_esc(p.get('title', '?'))[:50]}"
                                 ),
                                 parse_mode=ParseMode.HTML,
                             )
@@ -751,7 +777,7 @@ async def check_pending_orders(bot: Bot):
                                 chat_id=OWNER_ID,
                                 text=(
                                     f"⚠️ <b>AUTO-SELL FAILED</b>\n"
-                                    f"📌 {p.get('title', '?')[:50]}\n"
+                                    f"📌 {_esc(p.get('title', '?'))[:50]}\n"
                                     f"👉 Продай вручну на polymarket.com"
                                 ),
                                 parse_mode=ParseMode.HTML,
