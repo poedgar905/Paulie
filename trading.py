@@ -320,6 +320,55 @@ def _auto_set_allowances():
         logger.error("Auto-approve error: %s", e)
 
 
+def _auto_set_ctf_allowances():
+    """Set ERC1155 conditional token allowances needed for SELL."""
+    try:
+        from web3 import Web3
+        w3 = None
+        for rpc in ["https://polygon-bor-rpc.publicnode.com", "https://polygon.llamarpc.com"]:
+            try:
+                _w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 15}))
+                if _w3.is_connected():
+                    w3 = _w3
+                    break
+            except Exception:
+                continue
+        if not w3:
+            return
+
+        account = w3.eth.account.from_key(PRIVATE_KEY)
+        CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+        OPERATORS = [
+            ("0xC5d563A36AE78145C45a50134d48A1215220f80a", "Exchange"),
+            ("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E", "NegRisk"),
+            ("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296", "Adapter"),
+        ]
+        ABI = [
+            {"inputs":[{"name":"operator","type":"address"},{"name":"approved","type":"bool"}],"name":"setApprovalForAll","outputs":[],"stateMutability":"nonpayable","type":"function"},
+            {"inputs":[{"name":"account","type":"address"},{"name":"operator","type":"address"}],"name":"isApprovedForAll","outputs":[{"name":"","type":"bool"}],"stateMutability":"view","type":"function"},
+        ]
+        ctf = w3.eth.contract(address=Web3.to_checksum_address(CTF), abi=ABI)
+        nonce = w3.eth.get_transaction_count(account.address)
+
+        for op_addr, label in OPERATORS:
+            ok = ctf.functions.isApprovedForAll(account.address, Web3.to_checksum_address(op_addr)).call()
+            logger.info("CTF %s approved: %s", label, ok)
+            if not ok:
+                gas_price = int(w3.eth.gas_price * 1.5)
+                tx = ctf.functions.setApprovalForAll(
+                    Web3.to_checksum_address(op_addr), True
+                ).build_transaction({"from": account.address, "nonce": nonce, "gas": 100000, "gasPrice": gas_price})
+                signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                logger.info("CTF approve %s tx: %s", label, tx_hash.hex())
+                nonce += 1
+                import time as _t
+                _t.sleep(5)
+        logger.info("CTF approvals done")
+    except Exception as e:
+        logger.error("CTF approve error: %s", e)
+
+
 def place_limit_sell(token_id: str, price: float, size: float, condition_id: str = "") -> dict | None:
     """
     Place a limit SELL order via Python py-clob-client.
@@ -401,7 +450,18 @@ def place_limit_sell(token_id: str, price: float, size: float, condition_id: str
         return None
 
     except Exception as e:
+        error_str = str(e)
         logger.error("Error placing SELL order: %s", e)
+
+        # If allowance issue on SELL, it means CTF tokens not approved
+        if "allowance" in error_str.lower():
+            logger.warning("CTF allowance issue — running auto-approve for conditional tokens...")
+            try:
+                _auto_set_ctf_allowances()
+                logger.info("CTF auto-approve done, retry sell on next cycle")
+            except Exception as ae:
+                logger.error("CTF auto-approve failed: %s", ae)
+
         return None
 
 def place_market_sell(token_id: str, size: float, condition_id: str = "") -> dict | None:
