@@ -514,36 +514,30 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
         logger.error("Autocopy: no token_id for %s", title)
         return
 
-    # Check available balance before buying
-    from trading import get_balance, get_open_orders, cancel_order
+    # Check available balance (on-chain USDC minus pending order costs)
+    from trading import get_balance
+    from database import get_all_pending_copy_trades, get_all_open_copy_trades
     bal = get_balance()
-    if bal is not None and bal < amount:
-        # Not enough cash — cancel oldest live orders to free up funds
-        logger.warning("Low balance $%.2f < $%.2f needed, cancelling stale orders", bal, amount)
-        open_orders = get_open_orders()
-        cancelled = 0
-        for old_ord in sorted(open_orders, key=lambda x: x.get("timestamp", 0)):
-            oid = old_ord.get("id", "")
-            if oid and cancelled < 3:
-                try:
-                    cancel_order(oid)
-                    cancelled += 1
-                except Exception:
-                    pass
-        if cancelled > 0:
-            logger.info("Cancelled %d stale orders to free balance", cancelled)
-            import time as _t2
-            _t2.sleep(2)
-            bal = get_balance()
+    if bal is not None:
+        # Subtract cost of all PENDING (live) orders from available balance
+        pending = get_all_pending_copy_trades()
+        pending_cost = sum(float(p.get("usdc_spent", 0)) for p in pending)
+        available = bal - pending_cost
+        logger.info("Balance check: on-chain=$%.2f, pending_orders=$%.2f, available=$%.2f, need=$%.2f",
+                     bal, pending_cost, available, amount)
 
-    if bal is not None and bal < 1.0:
-        logger.warning("Balance too low ($%.2f), skipping autocopy", bal)
-        await bot.send_message(
-            chat_id=OWNER_ID,
-            text=f"⏭ <b>Autocopy skip</b> — баланс ${bal:.2f}, мало для копі",
-            parse_mode=ParseMode.HTML,
-        )
-        return
+        if available < amount:
+            logger.warning("Not enough available balance ($%.2f < $%.2f)", available, amount)
+            await bot.send_message(
+                chat_id=OWNER_ID,
+                text=(
+                    f"⏭ <b>Autocopy skip</b> — мало балансу\n"
+                    f"💰 Cash: ${bal:.2f} | Pending: ${pending_cost:.2f} | Free: ${available:.2f}\n"
+                    f"📌 {title}"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
 
     result = place_limit_buy(token_id, price, amount, condition_id)
 
@@ -789,30 +783,9 @@ async def check_pending_orders(bot: Bot):
                         f"👤 Copying: {trader_name}"
                     )
 
-                    # Check if trader already sold THIS EXACT token
-                    if has_trader_sold_token(p["trader_address"], p["token_id"]):
-                        logger.info("Trader already sold this token — auto-selling")
-                        result = place_market_sell(p["token_id"], float(p["shares"]), p["condition_id"])
-                        if result:
-                            close_copy_trade(p["id"], 0, 0, int(time.time()), pnl_usdc=0, pnl_pct=0)
-                            await bot.send_message(
-                                chat_id=OWNER_ID,
-                                text=(
-                                    f"🤖 <b>AUTO-SOLD</b> (трейдер вже вийшов)\n"
-                                    f"📌 {_esc(p.get('title', '?'))[:50]}"
-                                ),
-                                parse_mode=ParseMode.HTML,
-                            )
-                        else:
-                            await bot.send_message(
-                                chat_id=OWNER_ID,
-                                text=(
-                                    f"⚠️ <b>AUTO-SELL FAILED</b>\n"
-                                    f"📌 {_esc(p.get('title', '?'))[:50]}\n"
-                                    f"👉 Продай вручну на polymarket.com"
-                                ),
-                                parse_mode=ParseMode.HTML,
-                            )
+                    # Don't auto-sell here. Let normal polling detect trader's SELL
+                    # and handle it proportionally via _auto_sell_copies.
+                    logger.info("Order filled, waiting for trader sell signal via poll")
 
                 elif status_lower == "live" and age > 120:
                     # Still live after 2 min → cancel
