@@ -563,3 +563,42 @@ def has_trader_sold_token(trader_address: str, token_id: str) -> bool:
     ).fetchone()
     conn.close()
     return row["cnt"] > 0 if row else False
+
+
+# ── Risk Manager queries ─────────────────────────────────────────
+
+def get_total_open_exposure() -> float:
+    """Total USDC locked in OPEN + PENDING copy trades."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT COALESCE(SUM(usdc_spent), 0) as total FROM copy_trades WHERE status IN ('OPEN', 'PENDING')"
+    ).fetchone()
+    conn.close()
+    return float(row["total"]) if row else 0
+
+
+def find_open_copy_trades_by_token(trader_address: str, token_id: str) -> list[dict]:
+    """Find OPEN copy trades matching exact token_id."""
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT * FROM copy_trades
+           WHERE trader_address = ? AND token_id = ? AND status = 'OPEN'""",
+        (trader_address.lower(), token_id)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def has_trader_sold_token(trader_address: str, token_id: str) -> bool:
+    """Check if trader sold this exact token."""
+    conn = get_db()
+    row = conn.execute(
+        """SELECT COUNT(*) as cnt FROM seen_trades
+           WHERE trader_address = ? AND side = 'SELL'
+           AND condition_id IN (
+               SELECT condition_id FROM buy_messages WHERE token_id = ? AND trader_address = ?
+           )""",
+        (trader_address.lower(), token_id, trader_address.lower())
+    ).fetchone()
+    conn.close()
+    return row["cnt"] > 0 if row else False
