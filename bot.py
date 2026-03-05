@@ -945,74 +945,29 @@ async def post_init(app: Application):
     asyncio.create_task(check_pending_orders(app.bot))
     logger.info("Order checker task created")
 
-    # Start Google Sheets updater
-    try:
-        try:
-            from sheets import sheets_updater
-        except (ImportError, ModuleNotFoundError):
-            pass  # module removed in v2
-        asyncio.create_task(sheets_updater())
-        logger.info("Sheets updater task created")
-    except Exception as e:
-        logger.warning("Sheets updater failed to start: %s", e)
+    # Sheets updater — removed in v2
 
     # Start health monitor
     asyncio.create_task(health_monitor(app.bot))
     logger.info("Health monitor started")
 
-    # Start sniper checker
-    try:
-        from sniper import sniper_checker
-    except (ImportError, ModuleNotFoundError):
-        pass  # module removed in v2
-    asyncio.create_task(sniper_checker(app.bot))
-    logger.info("Sniper checker started")
+    # Sniper — removed in v2
 
-    # Start weather checker
-    try:
-        from weather_sniper import weather_checker
-    except (ImportError, ModuleNotFoundError):
-        pass  # module removed in v2
-    asyncio.create_task(weather_checker(app.bot))
-    logger.info("Weather checker started")
+    # Weather sniper — removed in v2
 
-    # Start adaptive BTC bot
-    try:
-        from btc_adaptive import adaptive_checker
-    except (ImportError, ModuleNotFoundError):
-        pass  # module removed in v2
-    asyncio.create_task(adaptive_checker(app.bot))
-    logger.info("Adaptive BTC bot checker started")
+    # Adaptive BTC — removed in v2
 
-    # Start MM bot
-    try:
-        from btc_mm import mm_checker
-    except (ImportError, ModuleNotFoundError):
-        pass  # module removed in v2
-    asyncio.create_task(mm_checker(app.bot))
-    logger.info("MM bot checker started")
+    # MM bot — removed in v2
 
-    # Start Liquidity scalper
-    try:
-        from btc_liquidity import liq_checker
-    except (ImportError, ModuleNotFoundError):
-        pass  # module removed in v2
-    asyncio.create_task(liq_checker(app.bot))
-    logger.info("Liquidity scalper started")
+    # Liquidity scalper — removed in v2
 
-    # Start Weather trader
-    try:
-        from weather_trader import weather_checker
-    except (ImportError, ModuleNotFoundError):
-        pass  # module removed in v2
-    asyncio.create_task(weather_checker(app.bot))
-    logger.info("Weather trader started")
+    # Weather trader — removed in v2
 
     trading = "✅" if is_trading_enabled() else "❌ (no key)"
     try:
         await app.bot.send_message(
             chat_id=OWNER_ID,
-            text=f"🤖 <b>Bot started!</b>\n⏱ Polling: 15s\n🔄 Order check: 30s\n📊 Sheets: 5min\n🏥 Health: 5min\n💰 Trading: {trading}",
+            text=f"🤖 <b>Bot v2 started!</b>\n⏱ Polling: 3s\n🔄 Order check: 30s\n🏥 Health: 5min\n💰 Trading: {trading}\n📊 FOK buy + Smart sell",
             parse_mode=ParseMode.HTML,
         )
     except Exception:
