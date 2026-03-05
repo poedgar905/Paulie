@@ -16,7 +16,7 @@ from database import (
     get_display_name, get_daily_big_trade_count, increment_daily_big_trade,
 )
 from polymarket_api import get_activity, detect_order_type
-from trading import is_trading_enabled, place_market_sell, place_limit_buy, get_token_id_for_market
+from trading import is_trading_enabled, place_market_sell, place_fok_buy, smart_sell, get_token_id_for_market
 from hashtags import detect_hashtag, get_hashtag_emoji
 
 logger = logging.getLogger(__name__)
@@ -206,24 +206,20 @@ def compute_pnl(buys: list[dict], sell_trade: dict) -> dict | None:
 
 def calc_autocopy_amount(trader_usdc: float, trader_address: str, price: float = 0) -> float | None:
     """
-    Calculate how much to spend based on trader's trade size.
-    < $1   → copy exact amount (as-is)
-    $1-$2  → copy exact amount (as-is)
-    $2-$10 → $2
-    $10-$50 → $3
-    $50+   → $5 (max bet)
-    Returns None if should skip.
+    Proportional copy: COPY_RATIO × trader amount.
+    Ensures we maintain same proportions across all ranges.
     """
-    if trader_usdc < 1.0:
-        amount = trader_usdc
-    elif trader_usdc <= 2.0:
-        amount = trader_usdc
-    elif trader_usdc <= 10.0:
-        amount = 2.0
-    elif trader_usdc <= 50.0:
-        amount = 3.0
-    else:
-        amount = 5.0
+    from risk_manager import calc_copy_amount, can_afford, adjust_amount_to_budget
+
+    amount = calc_copy_amount(trader_usdc)
+
+    ok, available, exposure = can_afford(amount)
+    if not ok and available > 0:
+        # Not enough for full amount — reduce but don't skip
+        amount = adjust_amount_to_budget(amount, available)
+    elif not ok:
+        # Truly no cash
+        return None
 
     return amount
 
@@ -539,7 +535,7 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
             )
             return
 
-    result = place_limit_buy(token_id, price, amount, condition_id)
+    result = place_fok_buy(token_id, price, amount, condition_id)
 
     if result:
         shares = result["size"]
@@ -562,22 +558,37 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
             title=title,
             hashtag=hashtag,
             source="autocopy",
-            status="PENDING",
+            status=result.get("status", "PENDING"),
         )
+
+        fill_status = result.get("status", "PENDING")
+        if fill_status == "FILLED":
+            status_emoji = "✅"
+            status_text = "FILLED одразу"
+            # Post to channel immediately
+            await _send_to_channel(bot,
+                f"🟢 <b>AUTOCOPY BUY</b>\n\n"
+                f"📌 <b>{title}</b>\n"
+                f"🎯 {outcome} @ {_price(result['price'])}\n"
+                f"💵 {_usd(amount)} ({_shares(shares)} shares)\n"
+                f"👤 Copying: {trader_name} ({_usd(trader_usdc)})"
+            )
+        else:
+            status_emoji = "⏳"
+            status_text = "PENDING"
 
         await bot.send_message(
             chat_id=OWNER_ID,
             text=(
                 f"🤖 <b>AUTOCOPY</b> — copying {trader_name}\n\n"
                 f"📌 <b>{title}</b>\n"
-                f"🎯 BUY {outcome} @ {_price(price)}\n"
+                f"🎯 BUY {outcome} @ {_price(result['price'])}\n"
                 f"💵 {_usd(amount)} ({_shares(shares)} shares)\n"
-                f"👤 Trader put: {_usd(trader_usdc)}\n\n"
-                f"⏳ Order pending — channel post after fill"
+                f"👤 Trader put: {_usd(trader_usdc)}\n"
+                f"{status_emoji} {status_text}"
             ),
             parse_mode=ParseMode.HTML,
         )
-        # DON'T post to channel yet — wait for FILLED confirmation in order_status_checker
     else:
         # Get diagnostic info
         from trading import get_balance, debug_balance_info
@@ -647,7 +658,13 @@ async def _auto_sell_copies(bot: Bot, trader_address: str, condition_id: str, ou
             if shares_to_sell < 0.1:
                 shares_to_sell = total_shares
 
-            result = place_market_sell(token_id, shares_to_sell, condition_id)
+            result = smart_sell(token_id, shares_to_sell, sell_price, condition_id)
+
+            if result and result.get("status") == "ghost":
+                # No shares on-chain — close ghost trade
+                close_copy_trade(copy["id"], 0, 0, sell_ts, pnl_usdc=-invested, pnl_pct=-100)
+                logger.warning("Ghost trade closed: %s", _esc(copy.get("title", "?")))
+                continue
 
             if result:
                 sell_usdc = shares_to_sell * sell_price
