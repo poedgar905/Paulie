@@ -1,18 +1,19 @@
 """
-Trading module — places BUY/SELL orders on Polymarket via CLOB API.
-Uses py-clob-client with MetaMask (signature_type=2).
+Trading module v2 — FOK buy, smart sell with retry, balance checks.
 """
 import logging
+import math
+import time
+
 from config import CLOB_API, CHAIN_ID, PRIVATE_KEY, FUNDER_ADDRESS, SIGNATURE_TYPE
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("trading")
 
 _client = None
 _client_ready = False
 
 
 def _get_client():
-    """Lazy-init the ClobClient (so import doesn't crash if no key)."""
     global _client, _client_ready
     if _client_ready:
         return _client
@@ -23,16 +24,13 @@ def _get_client():
     try:
         from py_clob_client.client import ClobClient
         _client = ClobClient(
-            CLOB_API,
-            key=PRIVATE_KEY,
-            chain_id=CHAIN_ID,
-            signature_type=SIGNATURE_TYPE,
-            funder=FUNDER_ADDRESS,
+            CLOB_API, key=PRIVATE_KEY, chain_id=CHAIN_ID,
+            signature_type=SIGNATURE_TYPE, funder=FUNDER_ADDRESS,
         )
         _client.set_api_creds(_client.create_or_derive_api_creds())
-        logger.info("CLOB client initialized (funder=%s, sig_type=%s)", FUNDER_ADDRESS, SIGNATURE_TYPE)
+        logger.info("CLOB client ready (funder=%s, sig=%s)", FUNDER_ADDRESS, SIGNATURE_TYPE)
     except Exception as e:
-        logger.error("Failed to init CLOB client: %s", e)
+        logger.error("CLOB client init failed: %s", e)
         _client = None
     _client_ready = True
     return _client
@@ -42,151 +40,96 @@ def is_trading_enabled() -> bool:
     return _get_client() is not None
 
 
+# ── Balance ──────────────────────────────────────────────────────
+
 def get_balance() -> float | None:
-    """Get USDC.e balance from Polygon blockchain."""
+    """Get USDC.e balance from Polygon."""
     try:
         from web3 import Web3
-        w3 = Web3(Web3.HTTPProvider("https://polygon-bor-rpc.publicnode.com", request_kwargs={"timeout": 10}))
-        
-        # USDC.e on Polygon (6 decimals)
-        USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-        ERC20_ABI = [{"inputs":[{"name":"account","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
-        
-        contract = w3.eth.contract(
-            address=Web3.to_checksum_address(USDC_ADDRESS),
-            abi=ERC20_ABI,
-        )
+        w3 = Web3(Web3.HTTPProvider("https://polygon-bor-rpc.publicnode.com",
+                                     request_kwargs={"timeout": 10}))
+        USDC = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        ABI = [{"inputs":[{"name":"account","type":"address"}],"name":"balanceOf",
+                "outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
+        contract = w3.eth.contract(address=Web3.to_checksum_address(USDC), abi=ABI)
         raw = contract.functions.balanceOf(Web3.to_checksum_address(FUNDER_ADDRESS)).call()
-        return raw / 1e6  # USDC has 6 decimals
+        return raw / 1e6
     except Exception as e:
-        logger.error("Error getting balance: %s", e)
+        logger.error("Balance error: %s", e)
     return None
 
 
 def get_conditional_balance(token_id: str) -> float | None:
-    """Get real conditional token (shares) balance on-chain."""
+    """Get real shares balance on-chain for a token."""
     try:
         from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
         client = _get_client()
         if not client:
             return None
-        params = BalanceAllowanceParams(
-            asset_type=AssetType.CONDITIONAL,
-            token_id=token_id,
-        )
+        params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
         resp = client.get_balance_allowance(params)
         if resp and "balance" in resp:
-            # Balance is in raw units (6 decimals for USDC-based)
-            raw = float(resp["balance"])
-            return raw / 1e6
+            return float(resp["balance"]) / 1e6
     except Exception as e:
-        logger.error("Error getting conditional balance: %s", e)
+        logger.error("Conditional balance error: %s", e)
     return None
 
 
-def debug_balance_info(token_id: str) -> str:
-    """Get full debug info about balance and allowances for a token."""
-    try:
-        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-        client = _get_client()
-        if not client:
-            return "Client not initialized"
-
-        # Check USDC balance
-        usdc_params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-        usdc = client.get_balance_allowance(usdc_params)
-
-        # Check conditional token balance
-        cond_params = BalanceAllowanceParams(
-            asset_type=AssetType.CONDITIONAL,
-            token_id=token_id,
-        )
-        cond = client.get_balance_allowance(cond_params)
-
-        return (
-            f"USDC: {usdc}\n"
-            f"Conditional ({token_id[:20]}...): {cond}"
-        )
-    except Exception as e:
-        return f"Debug error: {e}"
-
-
-def get_token_id_for_market(condition_id: str, outcome: str) -> str | None:
-    """Resolve condition_id + outcome to a CLOB token_id via Gamma API."""
-    try:
-        import requests
-        resp = requests.get(
-            "https://gamma-api.polymarket.com/markets",
-            params={"condition_id": condition_id},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            markets = resp.json()
-            if isinstance(markets, list) and markets:
-                market = markets[0]
-                tokens = market.get("clobTokenIds", "")
-                if isinstance(tokens, str):
-                    # Usually comma-separated or JSON
-                    import json
-                    try:
-                        tokens = json.loads(tokens)
-                    except (json.JSONDecodeError, TypeError):
-                        tokens = [t.strip() for t in tokens.split(",") if t.strip()]
-
-                if isinstance(tokens, list) and len(tokens) >= 2:
-                    # tokens[0] = Yes, tokens[1] = No
-                    if outcome.lower() == "yes":
-                        return tokens[0]
-                    else:
-                        return tokens[1]
-                elif isinstance(tokens, list) and len(tokens) == 1:
-                    return tokens[0]
-    except Exception as e:
-        logger.error("Error resolving token_id: %s", e)
-    return None
-
+# ── Neg Risk Detection ───────────────────────────────────────────
 
 _neg_risk_cache: dict[str, bool] = {}
 
 def get_neg_risk(condition_id: str) -> bool:
-    """Check if market is negative risk. Caches results."""
-    if not condition_id:
-        return False
-    
-    # Check cache first
     if condition_id in _neg_risk_cache:
         return _neg_risk_cache[condition_id]
-    
     try:
         import requests
-        resp = requests.get(
-            "https://gamma-api.polymarket.com/markets",
-            params={"condition_id": condition_id},
-            timeout=10,
-        )
+        resp = requests.get(f"https://gamma-api.polymarket.com/markets",
+                          params={"condition_id": condition_id}, timeout=10)
         if resp.status_code == 200:
             markets = resp.json()
             if isinstance(markets, list) and markets:
-                result = bool(markets[0].get("negRisk", False))
-                _neg_risk_cache[condition_id] = result
-                logger.info("neg_risk for %s: %s", condition_id[:12], result)
-                return result
+                nr = markets[0].get("neg_risk", False)
+                if isinstance(nr, str):
+                    nr = nr.lower() == "true"
+                _neg_risk_cache[condition_id] = bool(nr)
+                return bool(nr)
     except Exception as e:
-        logger.warning("get_neg_risk API failed for %s: %s", condition_id[:12], e)
-    
-    # Fallback: if condition_id lookup fails, check by token naming pattern
-    # BTC up/down markets are ALWAYS neg_risk
-    # Cache as True if API failed — safer to assume neg_risk for BTC markets
-    _neg_risk_cache[condition_id] = True
-    logger.warning("get_neg_risk fallback: assuming True for %s", condition_id[:12])
-    return True
+        logger.error("neg_risk check: %s", e)
+    _neg_risk_cache[condition_id] = False
+    return False
 
 
-def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_id: str = "", post_only: bool = False) -> dict | None:
+def get_token_id_for_market(condition_id: str, outcome: str) -> str | None:
+    try:
+        import requests, json
+        resp = requests.get("https://gamma-api.polymarket.com/markets",
+                          params={"condition_id": condition_id}, timeout=10)
+        if resp.status_code == 200:
+            markets = resp.json()
+            if isinstance(markets, list) and markets:
+                tokens = markets[0].get("clobTokenIds", "")
+                if isinstance(tokens, str):
+                    try:
+                        tokens = json.loads(tokens)
+                    except (json.JSONDecodeError, TypeError):
+                        tokens = [t.strip() for t in tokens.split(",") if t.strip()]
+                if isinstance(tokens, list) and len(tokens) >= 2:
+                    return tokens[0] if outcome.lower() == "yes" else tokens[1]
+                elif isinstance(tokens, list) and len(tokens) == 1:
+                    return tokens[0]
+    except Exception as e:
+        logger.error("Token resolve error: %s", e)
+    return None
+
+
+# ── BUY — FOK (Fill-or-Kill) ────────────────────────────────────
+
+def place_fok_buy(token_id: str, trader_price: float, amount_usdc: float,
+                  condition_id: str = "", slippage: float = 0.015) -> dict | None:
     """
-    Place a BUY order (GTC).
-    All orders go as GTC — sits in book if no match, executes if price matches.
-    Automatically detects neg_risk markets (BTC up/down etc).
+    FOK buy at trader_price + slippage.
+    Either fills instantly or cancels — no capital lock.
     """
     client = _get_client()
     if not client:
@@ -196,81 +139,242 @@ def place_limit_buy(token_id: str, price: float, amount_usdc: float, condition_i
         from py_clob_client.clob_types import OrderArgs, OrderType
         from py_clob_client.order_builder.constants import BUY
 
-        # size = number of shares = amount_usdc / price
-        import math
-        size = math.ceil(amount_usdc * 1.05 / price * 100) / 100
-        if size * price < 1.05:
-            size = math.ceil(1.05 / price * 100) / 100
+        buy_price = round(trader_price + slippage, 2)
+        if buy_price >= 1.0:
+            buy_price = 0.99
+        if buy_price <= 0:
+            return None
 
-        # Check neg_risk first
-        neg_risk = False
-        if condition_id:
-            neg_risk = get_neg_risk(condition_id)
-
-        # Polymarket requires minimum 5 shares for ALL markets
+        size = math.ceil(amount_usdc * 1.02 / buy_price * 100) / 100
         if size < 5:
             size = 5.0
 
-        # Round price to valid tick (0.01)
-        price = round(price, 2)
-        if price <= 0 or price >= 1:
-            logger.error("Invalid price: %s", price)
+        neg_risk = get_neg_risk(condition_id) if condition_id else False
+
+        bal = get_balance()
+        actual_cost = round(size * buy_price, 2)
+        logger.info("FOK BUY: %.2f¢ (+%.1f¢ slip), %s sh, $%.2f, bal=$%s, neg_risk=%s",
+                     buy_price * 100, slippage * 100, size, actual_cost,
+                     f"{bal:.2f}" if bal else "?", neg_risk)
+
+        order_args = OrderArgs(price=buy_price, size=size, side=BUY, token_id=token_id)
+        signed = client.create_order(order_args)
+
+        # Try FOK first, fallback to GTC if FOK not supported
+        resp = None
+        try:
+            resp = client.post_order(signed, orderType=OrderType.FOK, neg_risk=neg_risk)
+        except (TypeError, AttributeError):
+            # py-clob-client might not support FOK enum — try string
+            try:
+                resp = client.post_order(signed, "FOK", neg_risk=neg_risk)
+            except Exception:
+                # Last resort: GTC (will be monitored by order checker)
+                logger.warning("FOK not available, falling back to GTC")
+                resp = client.post_order(signed, orderType=OrderType.GTC, neg_risk=neg_risk)
+
+        logger.info("FOK BUY resp: %s", resp)
+
+        if not resp:
             return None
 
-        # Pre-check: log balance info for diagnostics
-        actual_cost = round(size * price, 2)
-        bal = get_balance()
-        logger.info("BUY pre-check: need $%.2f (%.1f sh × %.2f), USDC balance=$%s, neg_risk=%s",
-                     actual_cost, size, price, f"{bal:.2f}" if bal else "?", neg_risk)
+        status = resp.get("status", "")
+        order_id = resp.get("orderID", "")
 
-        order_args = OrderArgs(
-            price=price,
-            size=size,
-            side=BUY,
-            token_id=token_id,
-        )
+        if status == "matched":
+            return {
+                "order_id": order_id, "price": buy_price, "size": size,
+                "status": "FILLED", "response": resp,
+            }
+        elif status == "live":
+            # GTC fallback — order is pending
+            return {
+                "order_id": order_id, "price": buy_price, "size": size,
+                "status": "PENDING", "response": resp,
+            }
+        else:
+            # FOK killed — no fill, no capital lock
+            logger.info("FOK killed (no liquidity at %.2f¢)", buy_price * 100)
+            return None
 
+    except Exception as e:
+        logger.error("FOK BUY error: %s", e)
+        return None
+
+
+# ── SELL — Smart with retry ──────────────────────────────────────
+
+def smart_sell(token_id: str, shares: float, trader_sell_price: float,
+               condition_id: str = "") -> dict | None:
+    """
+    Smart sell with 3 levels:
+    1. Limit sell at trader_price - 2¢ (try to get close to his price)
+    2. If no fill in 10s → lower by 5¢
+    3. If still no fill → market sell (1¢)
+    """
+    # First check real balance
+    real_bal = get_conditional_balance(token_id)
+    if real_bal is not None and real_bal < 0.1:
+        logger.warning("No shares on-chain (bal=%.2f), skipping sell", real_bal)
+        return {"status": "ghost", "shares": 0}
+
+    if real_bal is not None and real_bal < shares:
+        logger.info("Adjusting sell: DB=%.1f, on-chain=%.1f", shares, real_bal)
+        shares = round(real_bal, 2)
+
+    if shares < 0.1:
+        return {"status": "ghost", "shares": 0}
+
+    neg_risk = get_neg_risk(condition_id) if condition_id else False
+
+    # Level 1: limit at trader_price - 2¢
+    if trader_sell_price > 0.05:
+        price1 = round(trader_sell_price - 0.02, 2)
+        result = _try_sell(token_id, shares, price1, neg_risk)
+        if result and result.get("status") == "matched":
+            logger.info("SELL L1 filled @ %.2f¢", price1 * 100)
+            return result
+
+        # Wait 8 seconds for fill
+        order_id = result.get("order_id", "") if result else ""
+        if order_id:
+            time.sleep(8)
+            status = check_order_status(order_id)
+            if status and status.lower() == "matched":
+                logger.info("SELL L1 filled after wait @ %.2f¢", price1 * 100)
+                return {"order_id": order_id, "price": price1, "size": shares, "status": "matched"}
+            # Cancel L1
+            cancel_order(order_id)
+
+    # Level 2: limit at trader_price - 7¢
+    if trader_sell_price > 0.10:
+        price2 = round(trader_sell_price - 0.07, 2)
+        result = _try_sell(token_id, shares, price2, neg_risk)
+        if result and result.get("status") == "matched":
+            logger.info("SELL L2 filled @ %.2f¢", price2 * 100)
+            return result
+
+        order_id = result.get("order_id", "") if result else ""
+        if order_id:
+            time.sleep(5)
+            status = check_order_status(order_id)
+            if status and status.lower() == "matched":
+                logger.info("SELL L2 filled after wait @ %.2f¢", price2 * 100)
+                return {"order_id": order_id, "price": price2, "size": shares, "status": "matched"}
+            cancel_order(order_id)
+
+    # Level 3: market sell (1¢)
+    logger.info("SELL L3: market sell @ 1¢")
+    result = _try_sell(token_id, shares, 0.01, neg_risk)
+    if result:
+        logger.info("SELL L3 result: %s", result.get("status"))
+    return result
+
+
+def _try_sell(token_id: str, size: float, price: float, neg_risk: bool) -> dict | None:
+    """Single sell attempt."""
+    client = _get_client()
+    if not client:
+        return None
+    try:
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.order_builder.constants import SELL
+
+        price = round(price, 2)
+        size = round(size, 2)
+        if size < 0.1 or price <= 0 or price >= 1:
+            return None
+
+        order_args = OrderArgs(price=price, size=size, side=SELL, token_id=token_id)
         signed = client.create_order(order_args)
+
         try:
             resp = client.post_order(signed, orderType=OrderType.GTC, neg_risk=neg_risk)
         except TypeError:
             try:
                 resp = client.post_order(signed, OrderType.GTC, neg_risk=neg_risk)
             except TypeError:
-                try:
-                    resp = client.post_order(signed, OrderType.GTC)
-                except TypeError:
-                    resp = client.post_order(signed)
-        logger.info("BUY GTC order: price=%s size=%s neg_risk=%s resp=%s", price, size, neg_risk, resp)
+                resp = client.post_order(signed, OrderType.GTC)
 
-        return {"order_id": resp.get("orderID", ""), "price": price, "size": size, "response": resp}
+        logger.info("SELL @ %.2f¢: %s", price * 100, resp)
 
+        if resp and resp.get("orderID"):
+            return {
+                "order_id": resp.get("orderID", ""),
+                "price": price, "size": size,
+                "status": resp.get("status", ""),
+                "response": resp,
+            }
+        if resp and resp.get("status") == "matched":
+            return {
+                "order_id": resp.get("orderID", ""),
+                "price": price, "size": size,
+                "status": "matched", "response": resp,
+            }
+        return None
     except Exception as e:
-        error_str = str(e)
-        logger.error("Error placing BUY order: %s", e)
-
-        # If allowance issue, try to set allowances automatically
-        if "allowance" in error_str.lower():
-            logger.warning("Allowance issue detected — running auto-approve...")
-            try:
-                _auto_set_allowances()
-                logger.info("Auto-approve done, retry buy on next cycle")
-            except Exception as ae:
-                logger.error("Auto-approve failed: %s", ae)
-
+        logger.error("SELL error @ %.2f¢: %s", price * 100, e)
         return None
 
 
-def _auto_set_allowances():
-    """Automatically set all required allowances for trading."""
+def place_market_sell(token_id: str, size: float, condition_id: str = "") -> dict | None:
+    """Backward compat — market sell at 1¢."""
+    return _try_sell(token_id, size, 0.01,
+                     get_neg_risk(condition_id) if condition_id else False)
+
+
+# ── Order Management ─────────────────────────────────────────────
+
+def check_order_status(order_id: str) -> str | None:
+    client = _get_client()
+    if not client:
+        return None
+    try:
+        resp = client.get_order(order_id)
+        return resp.get("status", None)
+    except Exception as e:
+        logger.error("Order status error %s: %s", order_id[:20], e)
+        return None
+
+
+def get_open_orders() -> list:
+    client = _get_client()
+    if not client:
+        return []
+    try:
+        resp = client.get_orders()
+        return resp if isinstance(resp, list) else []
+    except Exception as e:
+        logger.error("Open orders error: %s", e)
+        return []
+
+
+def cancel_order(order_id: str) -> bool:
+    client = _get_client()
+    if not client:
+        return False
+    try:
+        resp = client.cancel(order_id)
+        logger.info("Cancelled %s: %s", order_id[:20], resp)
+        return True
+    except Exception as e:
+        logger.error("Cancel error %s: %s", order_id[:20], e)
+        return False
+
+
+# ── Auto Allowances ──────────────────────────────────────────────
+
+def ensure_allowances():
+    """Check and set USDC + CTF allowances if needed."""
+    _auto_set_usdc_allowances()
+    _auto_set_ctf_allowances()
+
+
+def _auto_set_usdc_allowances():
     try:
         from web3 import Web3
-        RPCS = [
-            "https://polygon-bor-rpc.publicnode.com",
-            "https://polygon.llamarpc.com",
-        ]
         w3 = None
-        for rpc in RPCS:
+        for rpc in ["https://polygon-bor-rpc.publicnode.com", "https://polygon.llamarpc.com"]:
             try:
                 _w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 15}))
                 if _w3.is_connected():
@@ -279,49 +383,41 @@ def _auto_set_allowances():
             except Exception:
                 continue
         if not w3:
-            logger.error("Auto-approve: can't connect to RPC")
             return
 
         account = w3.eth.account.from_key(PRIVATE_KEY)
-        MAX_ALLOWANCE = 2**256 - 1
+        MAX = 2**256 - 1
+        USDC = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        SPENDERS = [
+            ("0xC5d563A36AE78145C45a50134d48A1215220f80a", "Exchange"),
+            ("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E", "NegRisk"),
+        ]
+        ABI = [
+            {"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],
+             "name":"approve","outputs":[{"name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},
+            {"inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],
+             "name":"allowance","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+        ]
+        usdc = w3.eth.contract(address=Web3.to_checksum_address(USDC), abi=ABI)
+        nonce = w3.eth.get_transaction_count(account.address)
 
-        USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-        CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
-        NEG_RISK_CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
-
-        ERC20_ABI = [{"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},
-                     {"inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
-
-        usdc = w3.eth.contract(address=Web3.to_checksum_address(USDC_ADDRESS), abi=ERC20_ABI)
-
-        # Check current allowance first
-        for spender, label in [(CTF_EXCHANGE, "Exchange"), (NEG_RISK_CTF_EXCHANGE, "NegRisk")]:
-            current = usdc.functions.allowance(account.address, Web3.to_checksum_address(spender)).call()
-            logger.info("Current %s allowance: %s", label, current)
-            if current < 10**12:  # less than $1M allowance
-                nonce = w3.eth.get_transaction_count(account.address)
+        for addr, label in SPENDERS:
+            current = usdc.functions.allowance(account.address, Web3.to_checksum_address(addr)).call()
+            if current < 10**12:
                 gas_price = int(w3.eth.gas_price * 1.5)
-                tx = usdc.functions.approve(
-                    Web3.to_checksum_address(spender), MAX_ALLOWANCE
-                ).build_transaction({
-                    "from": account.address,
-                    "nonce": nonce,
-                    "gas": 100000,
-                    "gasPrice": gas_price,
+                tx = usdc.functions.approve(Web3.to_checksum_address(addr), MAX).build_transaction({
+                    "from": account.address, "nonce": nonce, "gas": 100000, "gasPrice": gas_price,
                 })
                 signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
-                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-                logger.info("Auto-approve %s tx: %s", label, tx_hash.hex())
-                import time as _time
-                _time.sleep(5)
-
-        logger.info("Auto-approve complete")
+                w3.eth.send_raw_transaction(signed.raw_transaction)
+                logger.info("USDC approve %s sent", label)
+                nonce += 1
+                time.sleep(5)
     except Exception as e:
-        logger.error("Auto-approve error: %s", e)
+        logger.error("USDC approve error: %s", e)
 
 
 def _auto_set_ctf_allowances():
-    """Set ERC1155 conditional token allowances needed for SELL."""
     try:
         from web3 import Web3
         w3 = None
@@ -344,173 +440,25 @@ def _auto_set_ctf_allowances():
             ("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296", "Adapter"),
         ]
         ABI = [
-            {"inputs":[{"name":"operator","type":"address"},{"name":"approved","type":"bool"}],"name":"setApprovalForAll","outputs":[],"stateMutability":"nonpayable","type":"function"},
-            {"inputs":[{"name":"account","type":"address"},{"name":"operator","type":"address"}],"name":"isApprovedForAll","outputs":[{"name":"","type":"bool"}],"stateMutability":"view","type":"function"},
+            {"inputs":[{"name":"operator","type":"address"},{"name":"approved","type":"bool"}],
+             "name":"setApprovalForAll","outputs":[],"stateMutability":"nonpayable","type":"function"},
+            {"inputs":[{"name":"account","type":"address"},{"name":"operator","type":"address"}],
+             "name":"isApprovedForAll","outputs":[{"name":"","type":"bool"}],"stateMutability":"view","type":"function"},
         ]
         ctf = w3.eth.contract(address=Web3.to_checksum_address(CTF), abi=ABI)
         nonce = w3.eth.get_transaction_count(account.address)
 
-        for op_addr, label in OPERATORS:
-            ok = ctf.functions.isApprovedForAll(account.address, Web3.to_checksum_address(op_addr)).call()
-            logger.info("CTF %s approved: %s", label, ok)
+        for addr, label in OPERATORS:
+            ok = ctf.functions.isApprovedForAll(account.address, Web3.to_checksum_address(addr)).call()
             if not ok:
                 gas_price = int(w3.eth.gas_price * 1.5)
-                tx = ctf.functions.setApprovalForAll(
-                    Web3.to_checksum_address(op_addr), True
-                ).build_transaction({"from": account.address, "nonce": nonce, "gas": 100000, "gasPrice": gas_price})
+                tx = ctf.functions.setApprovalForAll(Web3.to_checksum_address(addr), True).build_transaction({
+                    "from": account.address, "nonce": nonce, "gas": 100000, "gasPrice": gas_price,
+                })
                 signed = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
-                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-                logger.info("CTF approve %s tx: %s", label, tx_hash.hex())
+                w3.eth.send_raw_transaction(signed.raw_transaction)
+                logger.info("CTF approve %s sent", label)
                 nonce += 1
-                import time as _t
-                _t.sleep(5)
-        logger.info("CTF approvals done")
+                time.sleep(5)
     except Exception as e:
         logger.error("CTF approve error: %s", e)
-
-
-def place_limit_sell(token_id: str, price: float, size: float, condition_id: str = "") -> dict | None:
-    """
-    Place a limit SELL order via Python py-clob-client.
-    Uses same client as BUY — credentials already working.
-    """
-    client = _get_client()
-    if not client:
-        return None
-
-    try:
-        from py_clob_client.clob_types import OrderArgs, OrderType
-        from py_clob_client.order_builder.constants import SELL
-
-        price = round(price, 2)
-        size = round(size, 2)
-
-        if size < 0.1:
-            logger.error("Sell size too small: %s", size)
-            return None
-
-        if price <= 0 or price >= 1:
-            logger.error("Invalid sell price: %s", price)
-            return None
-
-        neg_risk = False
-        if condition_id:
-            neg_risk = get_neg_risk(condition_id)
-
-        logger.info("SELL attempt: token=%s price=%s size=%s neg_risk=%s",
-                     token_id[:30], price, size, neg_risk)
-
-        order_args = OrderArgs(
-            price=price,
-            size=size,
-            side=SELL,
-            token_id=token_id,
-        )
-
-        signed = client.create_order(order_args)
-
-        # Try posting with different signatures (same pattern as buy)
-        resp = None
-        try:
-            resp = client.post_order(signed, orderType=OrderType.GTC, neg_risk=neg_risk)
-        except TypeError:
-            try:
-                resp = client.post_order(signed, OrderType.GTC, neg_risk=neg_risk)
-            except TypeError:
-                try:
-                    resp = client.post_order(signed, OrderType.GTC)
-                except TypeError:
-                    resp = client.post_order(signed)
-
-        logger.info("SELL order resp: %s", resp)
-
-        if resp and resp.get("orderID"):
-            return {
-                "order_id": resp.get("orderID", ""),
-                "price": price,
-                "size": size,
-                "response": resp,
-            }
-
-        # Check if it's an error response
-        if resp and resp.get("error"):
-            logger.error("SELL error: %s", resp["error"])
-            return None
-
-        # Even without orderID, if status is matched it worked
-        if resp and resp.get("status") == "matched":
-            return {
-                "order_id": resp.get("orderID", ""),
-                "price": price,
-                "size": size,
-                "response": resp,
-            }
-
-        logger.error("SELL unexpected response: %s", resp)
-        return None
-
-    except Exception as e:
-        error_str = str(e)
-        logger.error("Error placing SELL order: %s", e)
-
-        # If allowance issue on SELL, it means CTF tokens not approved
-        if "allowance" in error_str.lower():
-            logger.warning("CTF allowance issue — running auto-approve for conditional tokens...")
-            try:
-                _auto_set_ctf_allowances()
-                logger.info("CTF auto-approve done, retry sell on next cycle")
-            except Exception as ae:
-                logger.error("CTF auto-approve failed: %s", ae)
-
-        return None
-
-def place_market_sell(token_id: str, size: float, condition_id: str = "") -> dict | None:
-    """
-    Market sell = limit sell at very low price (1¢) for instant fill.
-    """
-    return place_limit_sell(token_id, 0.01, size, condition_id)
-
-
-def check_order_status(order_id: str) -> str | None:
-    """
-    Check status of an order. Returns: 'live', 'matched', 'cancelled', etc.
-    Returns None on error.
-    """
-    client = _get_client()
-    if not client:
-        return None
-    try:
-        resp = client.get_order(order_id)
-        return resp.get("status", None)
-    except Exception as e:
-        logger.error("Error checking order %s: %s", order_id, e)
-        return None
-
-
-def get_open_orders() -> list:
-    """Get all open/live orders from CLOB."""
-    client = _get_client()
-    if not client:
-        return []
-    try:
-        resp = client.get_orders()
-        if isinstance(resp, list):
-            return resp
-        return []
-    except Exception as e:
-        logger.error("Error getting open orders: %s", e)
-        return []
-
-
-def cancel_order(order_id: str) -> bool:
-    """Cancel an open order."""
-    client = _get_client()
-    if not client:
-        return False
-    try:
-        resp = client.cancel(order_id)
-        logger.info("Cancelled order %s: %s", order_id, resp)
-        return True
-    except Exception as e:
-        logger.error("Error cancelling order %s: %s", order_id, e)
-        return False
