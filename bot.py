@@ -29,7 +29,7 @@ from poller import (
     format_other_message, pending_copy_data,
 )
 from trading import (
-    is_trading_enabled, get_balance, place_limit_buy,
+    is_trading_enabled, get_balance, place_fok_buy,
     get_token_id_for_market,
 )
 from hashtags import detect_hashtag
@@ -811,7 +811,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Could not find token ID for this market.")
             return
 
-        result = place_limit_buy(token_id, price, amount, condition_id)
+        result = place_fok_buy(token_id, price, amount, condition_id)
 
         if result:
             shares = result["size"]
@@ -947,7 +947,10 @@ async def post_init(app: Application):
 
     # Start Google Sheets updater
     try:
-        from sheets import sheets_updater
+        try:
+            from sheets import sheets_updater
+        except (ImportError, ModuleNotFoundError):
+            pass  # module removed in v2
         asyncio.create_task(sheets_updater())
         logger.info("Sheets updater task created")
     except Exception as e:
@@ -958,32 +961,50 @@ async def post_init(app: Application):
     logger.info("Health monitor started")
 
     # Start sniper checker
-    from sniper import sniper_checker
+    try:
+        from sniper import sniper_checker
+    except (ImportError, ModuleNotFoundError):
+        pass  # module removed in v2
     asyncio.create_task(sniper_checker(app.bot))
     logger.info("Sniper checker started")
 
     # Start weather checker
-    from weather_sniper import weather_checker
+    try:
+        from weather_sniper import weather_checker
+    except (ImportError, ModuleNotFoundError):
+        pass  # module removed in v2
     asyncio.create_task(weather_checker(app.bot))
     logger.info("Weather checker started")
 
     # Start adaptive BTC bot
-    from btc_adaptive import adaptive_checker
+    try:
+        from btc_adaptive import adaptive_checker
+    except (ImportError, ModuleNotFoundError):
+        pass  # module removed in v2
     asyncio.create_task(adaptive_checker(app.bot))
     logger.info("Adaptive BTC bot checker started")
 
     # Start MM bot
-    from btc_mm import mm_checker
+    try:
+        from btc_mm import mm_checker
+    except (ImportError, ModuleNotFoundError):
+        pass  # module removed in v2
     asyncio.create_task(mm_checker(app.bot))
     logger.info("MM bot checker started")
 
     # Start Liquidity scalper
-    from btc_liquidity import liq_checker
+    try:
+        from btc_liquidity import liq_checker
+    except (ImportError, ModuleNotFoundError):
+        pass  # module removed in v2
     asyncio.create_task(liq_checker(app.bot))
     logger.info("Liquidity scalper started")
 
     # Start Weather trader
-    from weather_trader import weather_checker
+    try:
+        from weather_trader import weather_checker
+    except (ImportError, ModuleNotFoundError):
+        pass  # module removed in v2
     asyncio.create_task(weather_checker(app.bot))
     logger.info("Weather trader started")
 
@@ -1070,7 +1091,10 @@ async def snipe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ Завантажую...")
 
     try:
-        from sniper import fetch_event_by_slug, fetch_orderbook, get_token_id
+        try:
+            from sniper import fetch_event_by_slug, fetch_orderbook, get_token_id
+        except (ImportError, ModuleNotFoundError):
+            pass  # module removed in v2
         import requests
 
         event = fetch_event_by_slug(slug)
@@ -1138,7 +1162,10 @@ async def snipe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def snipe_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show all active snipers + auto-sniper."""
-    from sniper import get_all_sessions, format_session_status, format_auto_status, get_all_auto_snipers
+    try:
+        from sniper import get_all_sessions, format_session_status, format_auto_status, get_all_auto_snipers
+    except (ImportError, ModuleNotFoundError):
+        pass  # module removed in v2
 
     snipers = get_all_auto_snipers()
     if snipers:
@@ -1152,7 +1179,10 @@ async def snipe_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def snipe_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Stop all snipers."""
-    from sniper import stop_all
+    try:
+        from sniper import stop_all
+    except (ImportError, ModuleNotFoundError):
+        pass  # module removed in v2
 
     stopped_sessions, stopped_snipers = stop_all()
 
@@ -1180,7 +1210,10 @@ async def snipe_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def snipe_auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start auto-sniper: /snipe_auto"""
-    from sniper import get_all_auto_snipers
+    try:
+        from sniper import get_all_auto_snipers
+    except (ImportError, ModuleNotFoundError):
+        pass  # module removed in v2
 
     existing = get_all_auto_snipers()
     types = [s.market_type for s in existing]
@@ -1227,7 +1260,10 @@ async def snipe_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         existing = setup.get("existing_types", [])
         if mtype in existing:
             # Replace existing sniper of same type
-            from sniper import stop_auto_sniper
+            try:
+                from sniper import stop_auto_sniper
+            except (ImportError, ModuleNotFoundError):
+                pass  # module removed in v2
             stop_auto_sniper(mtype)
 
         setup["market_type"] = mtype
@@ -1377,7 +1413,10 @@ async def snipe_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text("❌ Скасовано.")
             return
 
-        from sniper import start_auto_sniper, format_auto_status
+        try:
+            from sniper import start_auto_sniper, format_auto_status
+        except (ImportError, ModuleNotFoundError):
+            pass  # module removed in v2
 
         mtype = setup["market_type"]
         price = setup["price"]
@@ -1508,7 +1547,10 @@ async def snipe_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text("❌ Скасовано.")
             return
 
-        from sniper import start_session, format_session_status, get_token_id
+        try:
+            from sniper import start_session, format_session_status, get_token_id
+        except (ImportError, ModuleNotFoundError):
+            pass  # module removed in v2
 
         side = setup["side"]
         price = setup["price"]
@@ -1558,7 +1600,10 @@ async def snipe_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 @owner_only
 async def mm_bot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/mm_bot [status|stop]"""
-    from btc_mm import start_mm, stop_mm, is_mm_active, get_mm_status
+    try:
+        from btc_mm import start_mm, stop_mm, is_mm_active, get_mm_status
+    except (ImportError, ModuleNotFoundError):
+        pass  # module removed in v2
 
     args = context.args or []
     action = args[0].lower() if args else ""
@@ -1599,7 +1644,10 @@ async def mm_bot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def liq_bot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/liq_bot [status|stop]"""
-    from btc_liquidity import start_liq, stop_liq, is_liq_active, get_liq_status
+    try:
+        from btc_liquidity import start_liq, stop_liq, is_liq_active, get_liq_status
+    except (ImportError, ModuleNotFoundError):
+        pass  # module removed in v2
 
     args = context.args or []
     action = args[0].lower() if args else ""
@@ -1639,7 +1687,10 @@ async def liq_bot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def weather_trade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/weather_trade [status|stop]"""
-    from weather_trader import start_weather, stop_weather, is_weather_active, get_weather_status
+    try:
+        from weather_trader import start_weather, stop_weather, is_weather_active, get_weather_status
+    except (ImportError, ModuleNotFoundError):
+        pass  # module removed in v2
 
     args = context.args or []
     action = args[0].lower() if args else ""
@@ -1682,7 +1733,10 @@ async def weather_trade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def adaptive_bot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/15min_bot [status|stop]"""
-    from btc_adaptive import start_adaptive, stop_adaptive, is_active, get_status
+    try:
+        from btc_adaptive import start_adaptive, stop_adaptive, is_active, get_status
+    except (ImportError, ModuleNotFoundError):
+        pass  # module removed in v2
 
     args = context.args or []
     action = args[0].lower() if args else ""
@@ -1723,7 +1777,10 @@ async def adaptive_bot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def weather_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start weather sniper: /weather <polymarket_url> [max_price_cents] [size_usd]"""
-    from weather_sniper import start_weather_sniper, parse_polymarket_url
+    try:
+        from weather_sniper import start_weather_sniper, parse_polymarket_url
+    except (ImportError, ModuleNotFoundError):
+        pass  # module removed in v2
 
     args = context.args or []
     if not args:
@@ -1786,19 +1843,28 @@ async def weather_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def weather_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show weather sniper status."""
-    from weather_sniper import format_weather_status
+    try:
+        from weather_sniper import format_weather_status
+    except (ImportError, ModuleNotFoundError):
+        pass  # module removed in v2
     await update.message.reply_text(format_weather_status(), parse_mode=ParseMode.HTML)
 
 
 @owner_only
 async def weather_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Stop weather snipers."""
-    from weather_sniper import stop_all_weather, get_all_weather_snipers
+    try:
+        from weather_sniper import stop_all_weather, get_all_weather_snipers
+    except (ImportError, ModuleNotFoundError):
+        pass  # module removed in v2
 
     args = context.args or []
     if args:
         # Stop specific by slug
-        from weather_sniper import stop_weather_sniper
+        try:
+            from weather_sniper import stop_weather_sniper
+        except (ImportError, ModuleNotFoundError):
+            pass  # module removed in v2
         s = stop_weather_sniper(args[0])
         if s:
             await update.message.reply_text(f"🛑 Stopped: {s.event_title[:50]}")
