@@ -75,6 +75,20 @@ def get_conditional_balance(token_id: str) -> float | None:
     return None
 
 
+def debug_balance_info(token_id: str) -> str:
+    """Debug info about balance and allowances."""
+    try:
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        client = _get_client()
+        if not client:
+            return "Client not initialized"
+        usdc = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+        cond = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id))
+        return f"USDC: {usdc}\nCond: {cond}"
+    except Exception as e:
+        return f"Debug error: {e}"
+
+
 # ── Neg Risk Detection ───────────────────────────────────────────
 
 _neg_risk_cache: dict[str, bool] = {}
@@ -163,15 +177,16 @@ def place_fok_buy(token_id: str, trader_price: float, amount_usdc: float,
         # Try FOK first, fallback to GTC if FOK not supported
         resp = None
         try:
-            resp = client.post_order(signed, orderType=OrderType.FOK, neg_risk=neg_risk)
+            resp = client.post_order(signed, orderType=OrderType.FOK)
         except (TypeError, AttributeError):
-            # py-clob-client might not support FOK enum — try string
             try:
-                resp = client.post_order(signed, "FOK", neg_risk=neg_risk)
+                resp = client.post_order(signed, "FOK")
             except Exception:
-                # Last resort: GTC (will be monitored by order checker)
                 logger.warning("FOK not available, falling back to GTC")
-                resp = client.post_order(signed, orderType=OrderType.GTC, neg_risk=neg_risk)
+                try:
+                    resp = client.post_order(signed, orderType=OrderType.GTC)
+                except TypeError:
+                    resp = client.post_order(signed, OrderType.GTC)
 
         logger.info("FOK BUY resp: %s", resp)
 
@@ -289,12 +304,9 @@ def _try_sell(token_id: str, size: float, price: float, neg_risk: bool) -> dict 
         signed = client.create_order(order_args)
 
         try:
-            resp = client.post_order(signed, orderType=OrderType.GTC, neg_risk=neg_risk)
+            resp = client.post_order(signed, orderType=OrderType.GTC)
         except TypeError:
-            try:
-                resp = client.post_order(signed, OrderType.GTC, neg_risk=neg_risk)
-            except TypeError:
-                resp = client.post_order(signed, OrderType.GTC)
+            resp = client.post_order(signed, OrderType.GTC)
 
         logger.info("SELL @ %.2f¢: %s", price * 100, resp)
 
