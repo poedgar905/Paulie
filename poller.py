@@ -13,7 +13,7 @@ from database import (
     get_all_traders, is_trade_seen, mark_trade_seen,
     save_buy_message, find_buy_message, find_all_open_buys, close_buy_messages,
     find_open_copy_trades, find_open_copy_trades_by_token, close_copy_trade, save_copy_trade,
-    get_display_name, get_daily_big_trade_count, increment_daily_big_trade,
+    get_display_name,
 )
 from polymarket_api import get_activity, detect_order_type
 from trading import is_trading_enabled, place_market_sell, place_fok_buy, smart_sell, get_token_id_for_market
@@ -540,10 +540,6 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
     if result:
         shares = result["size"]
         order_id = result.get("order_id", "")
-
-        # Track $50+ trades
-        if trader_usdc >= 50:
-            increment_daily_big_trade(trader_address)
 
         save_copy_trade(
             trader_address=trader_address,
