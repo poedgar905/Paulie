@@ -159,9 +159,10 @@ def place_fok_buy(token_id: str, trader_price: float, amount_usdc: float,
         if buy_price <= 0:
             return None
 
-        size = math.ceil(amount_usdc * 1.02 / buy_price * 100) / 100
+        size = math.floor(amount_usdc * 1.02 / buy_price * 100) / 100
         if size < 5:
             size = 5.0
+        size = round(size, 2)  # strict 2 decimal places
 
         neg_risk = get_neg_risk(condition_id) if condition_id else False
 
