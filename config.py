@@ -32,7 +32,7 @@ COPY_RATIO = float(os.getenv("COPY_RATIO", "0.10"))       # 10% of trader's amou
 MIN_COPY_AMOUNT = float(os.getenv("MIN_COPY_AMOUNT", "1.0"))  # min $1 per trade
 MAX_COPY_AMOUNT = float(os.getenv("MAX_COPY_AMOUNT", "15.0")) # max $15 per trade
 BUY_SLIPPAGE = float(os.getenv("BUY_SLIPPAGE", "0.015"))  # +1.5¢ above trader price
-SAFETY_BUFFER = float(os.getenv("SAFETY_BUFFER", "2.0"))   # keep $2 reserve
+SAFETY_BUFFER = float(os.getenv("SAFETY_BUFFER", "0.50"))   # keep $0.50 reserve
 
 # ── Channel ──────────────────────────────────────────────────────
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
