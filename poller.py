@@ -492,10 +492,19 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
 
     amount = calc_autocopy_amount(trader_usdc, trader_address, price)
     if amount is None:
-        logger.info("Autocopy skip: $50+ limit reached for %s today", trader_name)
+        from trading import get_balance
+        from database import get_total_open_exposure
+        bal = get_balance() or 0
+        exp = get_total_open_exposure()
+        logger.info("Autocopy skip: no cash (bal=$%.2f, exp=$%.2f) for %s", bal, exp, trader_name)
         await bot.send_message(
             chat_id=OWNER_ID,
-            text=f"⏭ <b>Autocopy skipped</b> — $50+ daily limit reached for {trader_name}",
+            text=(
+                f"⏭ <b>Autocopy skip</b> — мало балансу\n"
+                f"💰 Cash: ${bal:.2f} | Open: ${exp:.2f}\n"
+                f"📌 {title}\n"
+                f"👉 Закинь USDC на гаманець"
+            ),
             parse_mode=ParseMode.HTML,
         )
         return
