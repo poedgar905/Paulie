@@ -118,6 +118,12 @@ def _migrate(conn):
                 pass
 
     # Migrate seen_trades: add condition_id + side columns for proper dedup
+
+    # Fix FOK bug: FILLED status should be OPEN (we have shares, ready to sell)
+    try:
+        conn.execute("UPDATE copy_trades SET status = 'OPEN' WHERE status = 'FILLED'")
+    except Exception:
+        pass
     st_cols = {c["name"] for c in conn.execute("PRAGMA table_info(seen_trades)").fetchall()}
     if "condition_id" not in st_cols:
         try:
