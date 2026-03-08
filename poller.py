@@ -563,7 +563,7 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
             title=title,
             hashtag=hashtag,
             source="autocopy",
-            status=result.get("status", "PENDING"),
+            status="OPEN" if result.get("status") == "FILLED" else "PENDING",
         )
 
         fill_status = result.get("status", "PENDING")
