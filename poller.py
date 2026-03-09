@@ -476,13 +476,24 @@ async def _send_notification(bot: Bot, trade: dict, address: str, display_name: 
 
 async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trader_name: str, hashtag: str):
     """Automatically copy a BUY trade — place GTC at trader's price and save."""
-    from database import get_autocopy_tags
+    from database import get_autocopy_tags, get_autocopy_event_filters
 
     # Check if hashtag is allowed for this trader's autocopy
     allowed_tags = get_autocopy_tags(trader_address)
     if allowed_tags and hashtag not in allowed_tags:
         logger.info("Autocopy skip: %s not in allowed tags %s for %s", hashtag, allowed_tags, trader_name)
         return
+
+    # Check if event/title matches allowed events filter
+    raw_title = trade.get("title", "")
+    event_filters = get_autocopy_event_filters(trader_address)
+    if event_filters:
+        title_lower = raw_title.lower()
+        matched = any(ef.lower() in title_lower for ef in event_filters)
+        if not matched:
+            logger.info("Autocopy skip: title '%s' not in event filters %s", raw_title[:40], event_filters)
+            return
+
     trader_usdc = float(trade.get("usdcSize", 0))
     price = float(trade.get("price", 0))
     condition_id = trade.get("conditionId", "")
