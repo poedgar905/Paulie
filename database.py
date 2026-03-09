@@ -215,13 +215,27 @@ def get_all_traders() -> list[dict]:
 def find_trader_by_name(name: str) -> dict | None:
     traders = get_all_traders()
     name_lower = name.lower()
+    # Exact match first
     for t in traders:
         if t.get("nickname") and t["nickname"].lower() == name_lower:
             return t
         if t.get("username") and t["username"].lower() == name_lower:
             return t
+    # Partial match (contains)
+    for t in traders:
+        if t.get("nickname") and name_lower in t["nickname"].lower():
+            return t
+        if t.get("username") and name_lower in t["username"].lower():
+            return t
+        if t.get("profile_url") and name_lower in t["profile_url"].lower():
+            return t
+    # Address prefix
+    for t in traders:
         if t["address"].lower().startswith(name_lower):
             return t
+    # Last resort: if only 1 trader, return it
+    if len(traders) == 1:
+        return traders[0]
     return None
 
 
