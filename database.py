@@ -611,10 +611,10 @@ def has_trader_sold_token(trader_address: str, token_id: str) -> bool:
     return row["cnt"] > 0 if row else False
 
 
-# ── Event filter for autocopy ────────────────────────────────────
+# ── Event filter for autocopy (by eventSlug from URL) ────────────
 
-def get_autocopy_event_filters(trader_address: str) -> list[str]:
-    """Get list of allowed event slugs/keywords for this trader. Empty = all events."""
+def get_autocopy_event_slugs(trader_address: str) -> list[str]:
+    """Get list of allowed eventSlugs. Empty = all events."""
     conn = get_db()
     row = conn.execute(
         "SELECT autocopy_events FROM traders WHERE address = ?",
@@ -626,12 +626,12 @@ def get_autocopy_event_filters(trader_address: str) -> list[str]:
     return []
 
 
-def set_autocopy_event_filter(trader_address: str, events: str):
-    """Set allowed events. Comma-separated keywords like 'March 5,March 7'. Empty = all."""
+def set_autocopy_event_slugs(trader_address: str, slugs: str):
+    """Set allowed event slugs. Comma-separated. Empty = all."""
     conn = get_db()
     conn.execute(
         "UPDATE traders SET autocopy_events = ? WHERE address = ?",
-        (events, trader_address.lower())
+        (slugs, trader_address.lower())
     )
     conn.commit()
     conn.close()
