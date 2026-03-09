@@ -341,36 +341,55 @@ async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Extract eventSlug from URLs
-    slugs = []
+    slugs_to_add = []
+    slugs_to_remove = []
     for arg in rest:
-        # Match polymarket.com/event/SLUG or polymarket.com/event/SLUG/...
-        match = re.search(r'polymarket\.com/event/([^/?#\s]+)', arg)
-        if match:
-            slugs.append(match.group(1))
-        else:
-            # Maybe just a raw slug
-            if not arg.startswith("http"):
-                slugs.append(arg)
+        # Check if removing (prefix with - or "remove" or "del")
+        is_remove = arg.startswith("-") or arg.startswith("!")
+        clean_arg = arg.lstrip("-!")
 
-    if not slugs:
+        # Match polymarket.com/event/SLUG or polymarket.com/event/SLUG/...
+        match = re.search(r'polymarket\.com/event/([^/?#\s]+)', clean_arg)
+        if match:
+            slug = match.group(1)
+        elif not clean_arg.startswith("http"):
+            slug = clean_arg
+        else:
+            continue
+
+        if is_remove:
+            slugs_to_remove.append(slug)
+        else:
+            slugs_to_add.append(slug)
+
+    if not slugs_to_add and not slugs_to_remove:
         await update.message.reply_text(
             "❌ Не знайшов eventSlug в URL.\n\n"
-            "Приклад правильного URL:\n"
-            "<code>https://polymarket.com/event/elon-musk-tweets-march-10</code>",
+            "Приклад:\n"
+            "<code>/events name URL</code> — додати\n"
+            "<code>/events name -URL</code> — видалити\n"
+            "<code>/events name ALL</code> — скинути всі",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    # Get existing slugs and add new ones (don't replace)
+    # Get existing slugs, add new, remove marked
     existing = get_autocopy_event_slugs(trader["address"])
-    all_slugs = list(set(existing + slugs))
-    set_autocopy_event_slugs(trader["address"], ",".join(all_slugs))
+    all_slugs = list(set(existing + slugs_to_add))
+    all_slugs = [s for s in all_slugs if s not in slugs_to_remove]
 
-    lines = [f"✅ <b>{name}</b> — фільтр оновлено:\n"]
-    for s in all_slugs:
-        lines.append(f"  • <code>{s}</code>")
-    lines.append(f"\nКопіюємо тільки ці {len(all_slugs)} подій")
-    lines.append(f"Скинути: /events <code>{trader_name} ALL</code>")
+    if all_slugs:
+        set_autocopy_event_slugs(trader["address"], ",".join(all_slugs))
+        lines = [f"✅ <b>{name}</b> — фільтр оновлено:\n"]
+        for s in all_slugs:
+            lines.append(f"  • <code>{s}</code>")
+        if slugs_to_remove:
+            lines.append(f"\n🗑 Видалено: {', '.join(slugs_to_remove)}")
+        lines.append(f"\nКопіюємо тільки ці {len(all_slugs)} подій")
+        lines.append(f"Скинути: /events <code>{trader_name} ALL</code>")
+    else:
+        set_autocopy_event_slugs(trader["address"], "")
+        lines = [f"✅ <b>{name}</b> — фільтри очищені, копіюємо ВСІ події"]
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
