@@ -327,7 +327,13 @@ async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     trader = find_trader_by_name(trader_name)
     if not trader:
-        await update.message.reply_text(f"❌ Trader <b>{trader_name}</b> not found.", parse_mode=ParseMode.HTML)
+        traders = get_all_traders()
+        names = [get_display_name(t) for t in traders]
+        await update.message.reply_text(
+            f"❌ Trader <b>{trader_name}</b> not found.\n\n"
+            f"Доступні: {', '.join(names) if names else 'нема трейдерів'}",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     name = get_display_name(trader)
