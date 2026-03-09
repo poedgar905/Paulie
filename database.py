@@ -109,6 +109,7 @@ def _migrate(conn):
         ("copy_trades", "pnl_usdc", "REAL"),
         ("copy_trades", "pnl_pct", "REAL"),
         ("copy_trades", "source", "TEXT DEFAULT 'manual'"),
+        ("traders", "autocopy_events", "TEXT"),
     ]
     for table, col, coltype in migrations:
         if col not in existing.get(table, set()):
@@ -608,3 +609,29 @@ def has_trader_sold_token(trader_address: str, token_id: str) -> bool:
     ).fetchone()
     conn.close()
     return row["cnt"] > 0 if row else False
+
+
+# ── Event filter for autocopy ────────────────────────────────────
+
+def get_autocopy_event_filters(trader_address: str) -> list[str]:
+    """Get list of allowed event slugs/keywords for this trader. Empty = all events."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT autocopy_events FROM traders WHERE address = ?",
+        (trader_address.lower(),)
+    ).fetchone()
+    conn.close()
+    if row and row.get("autocopy_events"):
+        return [e.strip() for e in row["autocopy_events"].split(",") if e.strip()]
+    return []
+
+
+def set_autocopy_event_filter(trader_address: str, events: str):
+    """Set allowed events. Comma-separated keywords like 'March 5,March 7'. Empty = all."""
+    conn = get_db()
+    conn.execute(
+        "UPDATE traders SET autocopy_events = ? WHERE address = ?",
+        (events, trader_address.lower())
+    )
+    conn.commit()
+    conn.close()
