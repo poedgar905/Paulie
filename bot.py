@@ -281,6 +281,64 @@ async def autocopy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Use ON or OFF")
 
 
+# ── /events ─────────────────────────────────────────────────────
+@owner_only
+async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set event date filter for autocopy.
+    Usage: /events TraderName March 10,March 12
+    Or: /events TraderName ALL (to copy all events)
+    Or: /events (to see current filters)
+    """
+    from database import get_autocopy_event_filters, set_autocopy_event_filter
+
+    if not context.args:
+        # Show current filters
+        traders = get_all_traders()
+        lines = ["<b>📅 Event Filters:</b>\n"]
+        for t in traders:
+            if t.get("autocopy"):
+                name = get_display_name(t)
+                filters = get_autocopy_event_filters(t["address"])
+                if filters:
+                    lines.append(f"  {name}: {', '.join(filters)}")
+                else:
+                    lines.append(f"  {name}: всі події")
+        lines.append(f"\nUsage: /events <code>name March 10,March 12</code>")
+        lines.append(f"Clear: /events <code>name ALL</code>")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/events <code>name March 10,March 12</code> — тільки ці дати\n"
+            "/events <code>name ALL</code> — всі події",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    trader_name = context.args[0]
+    filter_text = " ".join(context.args[1:])
+
+    trader = find_trader_by_name(trader_name)
+    if not trader:
+        await update.message.reply_text(f"❌ Trader <b>{trader_name}</b> not found.", parse_mode=ParseMode.HTML)
+        return
+
+    name = get_display_name(trader)
+
+    if filter_text.upper() == "ALL":
+        set_autocopy_event_filter(trader["address"], "")
+        await update.message.reply_text(f"✅ <b>{name}</b> — копіюємо ВСІ події", parse_mode=ParseMode.HTML)
+    else:
+        set_autocopy_event_filter(trader["address"], filter_text)
+        await update.message.reply_text(
+            f"✅ <b>{name}</b> — фільтр: <code>{filter_text}</code>\n"
+            f"Копіюємо тільки угоди з цими словами в назві",
+            parse_mode=ParseMode.HTML,
+        )
+
+
 # ── /remove ─────────────────────────────────────────────────────
 @owner_only
 async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -922,6 +980,7 @@ async def post_init(app: Application):
         BotCommand("portfolio", "💼 Мої копі-трейди"),
         BotCommand("cleanup", "🧹 Видалити привидні трейди"),
         BotCommand("autocopy", "🤖 Автокопітрейдинг"),
+        BotCommand("events", "📅 Фільтр подій для копі"),
         BotCommand("status", "📊 Статус бота"),
     ])
 
@@ -1833,6 +1892,7 @@ def main():
     app.add_handler(CommandHandler("remove", remove_cmd))
     app.add_handler(CommandHandler("nick", nick_cmd))
     app.add_handler(CommandHandler("autocopy", autocopy_cmd))
+    app.add_handler(CommandHandler("events", events_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("check", check_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
