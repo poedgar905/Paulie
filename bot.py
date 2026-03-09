@@ -284,41 +284,46 @@ async def autocopy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /events ─────────────────────────────────────────────────────
 @owner_only
 async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set event date filter for autocopy.
-    Usage: /events TraderName March 10,March 12
-    Or: /events TraderName ALL (to copy all events)
-    Or: /events (to see current filters)
+    """Set event filter by Polymarket URL.
+    Usage: /events TraderName URL1 URL2 ...
+    Or: /events TraderName ALL
     """
-    from database import get_autocopy_event_filters, set_autocopy_event_filter
+    from database import get_autocopy_event_slugs, set_autocopy_event_slugs
+    import re
 
     if not context.args:
-        # Show current filters
         traders = get_all_traders()
         lines = ["<b>📅 Event Filters:</b>\n"]
         for t in traders:
             if t.get("autocopy"):
                 name = get_display_name(t)
-                filters = get_autocopy_event_filters(t["address"])
-                if filters:
-                    lines.append(f"  {name}: {', '.join(filters)}")
+                slugs = get_autocopy_event_slugs(t["address"])
+                if slugs:
+                    lines.append(f"  {name}:")
+                    for s in slugs:
+                        lines.append(f"    • <code>{s}</code>")
                 else:
                     lines.append(f"  {name}: всі події")
-        lines.append(f"\nUsage: /events <code>name March 10,March 12</code>")
-        lines.append(f"Clear: /events <code>name ALL</code>")
+        lines.append("")
+        lines.append("Додати: /events <code>name URL</code>")
+        lines.append("Кілька: /events <code>name URL1 URL2</code>")
+        lines.append("Всі: /events <code>name ALL</code>")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
         return
 
     if len(context.args) < 2:
         await update.message.reply_text(
-            "Usage:\n"
-            "/events <code>name March 10,March 12</code> — тільки ці дати\n"
-            "/events <code>name ALL</code> — всі події",
+            "Використання:\n\n"
+            "/events <code>name URL</code>\n"
+            "/events <code>name URL1 URL2</code>\n"
+            "/events <code>name ALL</code>\n\n"
+            "URL = силка на подію з polymarket.com",
             parse_mode=ParseMode.HTML,
         )
         return
 
     trader_name = context.args[0]
-    filter_text = " ".join(context.args[1:])
+    rest = context.args[1:]
 
     trader = find_trader_by_name(trader_name)
     if not trader:
@@ -327,16 +332,47 @@ async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     name = get_display_name(trader)
 
-    if filter_text.upper() == "ALL":
-        set_autocopy_event_filter(trader["address"], "")
-        await update.message.reply_text(f"✅ <b>{name}</b> — копіюємо ВСІ події", parse_mode=ParseMode.HTML)
-    else:
-        set_autocopy_event_filter(trader["address"], filter_text)
+    if rest[0].upper() == "ALL":
+        set_autocopy_event_slugs(trader["address"], "")
         await update.message.reply_text(
-            f"✅ <b>{name}</b> — фільтр: <code>{filter_text}</code>\n"
-            f"Копіюємо тільки угоди з цими словами в назві",
+            f"✅ <b>{name}</b> — копіюємо ВСІ події",
             parse_mode=ParseMode.HTML,
         )
+        return
+
+    # Extract eventSlug from URLs
+    slugs = []
+    for arg in rest:
+        # Match polymarket.com/event/SLUG or polymarket.com/event/SLUG/...
+        match = re.search(r'polymarket\.com/event/([^/?#\s]+)', arg)
+        if match:
+            slugs.append(match.group(1))
+        else:
+            # Maybe just a raw slug
+            if not arg.startswith("http"):
+                slugs.append(arg)
+
+    if not slugs:
+        await update.message.reply_text(
+            "❌ Не знайшов eventSlug в URL.\n\n"
+            "Приклад правильного URL:\n"
+            "<code>https://polymarket.com/event/elon-musk-tweets-march-10</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Get existing slugs and add new ones (don't replace)
+    existing = get_autocopy_event_slugs(trader["address"])
+    all_slugs = list(set(existing + slugs))
+    set_autocopy_event_slugs(trader["address"], ",".join(all_slugs))
+
+    lines = [f"✅ <b>{name}</b> — фільтр оновлено:\n"]
+    for s in all_slugs:
+        lines.append(f"  • <code>{s}</code>")
+    lines.append(f"\nКопіюємо тільки ці {len(all_slugs)} подій")
+    lines.append(f"Скинути: /events <code>{trader_name} ALL</code>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # ── /remove ─────────────────────────────────────────────────────
