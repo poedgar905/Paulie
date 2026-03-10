@@ -290,11 +290,50 @@ async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     traders = get_all_traders()
     autocopy_traders = [t for t in traders if t.get("autocopy")]
 
+    # If no autocopy traders, try all traders
     if not autocopy_traders:
-        await update.message.reply_text("❌ Нема трейдерів з autocopy ON.\nСпочатку /autocopy name ON")
+        autocopy_traders = traders
+
+    if not autocopy_traders:
+        await update.message.reply_text("❌ Нема трейдерів. Додай через /add")
         return
 
-    # Show current filters + buttons to add/clear
+    # If only 1 trader — skip selection, go straight to add mode
+    if len(autocopy_traders) == 1:
+        t = autocopy_traders[0]
+        context.user_data["ev_add_trader"] = t["address"]
+        name = get_display_name(t)
+        slugs = get_autocopy_event_slugs(t["address"])
+
+        lines = [f"📅 <b>Events для {name}:</b>\n"]
+        buttons = []
+
+        if slugs:
+            for s in slugs:
+                lines.append(f"  • <code>{s}</code>")
+                addr_short = t["address"][:10]
+                buttons.append([
+                    InlineKeyboardButton(f"🗑 {s[:40]}", callback_data=f"ev_rm:{addr_short}|{s[:50]}"),
+                ])
+        else:
+            lines.append("  Фільтри не встановлені — копіюємо ВСІ події")
+
+        lines.append("\n👇 <b>Скинь силку на подію з Polymarket щоб додати:</b>")
+
+        addr_short = t["address"][:10]
+        if slugs:
+            buttons.append([
+                InlineKeyboardButton("🗑 Очистити всі фільтри", callback_data=f"ev_clear:{addr_short}"),
+            ])
+
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+        )
+        return
+
+    # Multiple traders — show selection buttons
     lines = ["<b>📅 Event Filters:</b>\n"]
     buttons = []
 
@@ -317,7 +356,7 @@ async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton(f"🗑 Очистити фільтри {name}", callback_data=f"ev_clear:{addr_short}"),
             ])
 
-    lines.append("\nНатисни ➕ щоб додати event по URL")
+    lines.append("\nНатисни ➕ або скинь силку на подію")
 
     await update.message.reply_text(
         "\n".join(lines),
