@@ -553,6 +553,20 @@ async def _handle_autocopy_buy(bot: Bot, trade: dict, trader_address: str, trade
             )
             return
 
+    # Check per-token spending cap — max $2 per token_id
+    from database import get_token_total_spent
+    MAX_PER_TOKEN = 2.0
+    already_spent = get_token_total_spent(trader_address, token_id)
+    if already_spent >= MAX_PER_TOKEN:
+        logger.info("Autocopy skip: already $%.2f on token %s (max $%.2f)", already_spent, token_id[:20], MAX_PER_TOKEN)
+        return
+    # Reduce amount if it would exceed cap
+    remaining = MAX_PER_TOKEN - already_spent
+    if amount > remaining:
+        amount = round(remaining, 2)
+        if amount < 0.10:
+            return
+
     result = place_fok_buy(token_id, price, amount, condition_id)
 
     if result:
