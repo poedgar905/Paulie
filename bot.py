@@ -284,120 +284,46 @@ async def autocopy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /events ─────────────────────────────────────────────────────
 @owner_only
 async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set event filter by Polymarket URL.
-    Usage: /events TraderName URL1 URL2 ...
-    Or: /events TraderName ALL
-    """
-    from database import get_autocopy_event_slugs, set_autocopy_event_slugs
-    import re
+    """Interactive event filter management."""
+    from database import get_autocopy_event_slugs
 
-    if not context.args:
-        traders = get_all_traders()
-        lines = ["<b>📅 Event Filters:</b>\n"]
-        for t in traders:
-            if t.get("autocopy"):
-                name = get_display_name(t)
-                slugs = get_autocopy_event_slugs(t["address"])
-                if slugs:
-                    lines.append(f"  {name}:")
-                    for s in slugs:
-                        lines.append(f"    • <code>{s}</code>")
-                else:
-                    lines.append(f"  {name}: всі події")
-        lines.append("")
-        lines.append("Додати: /events <code>name URL</code>")
-        lines.append("Кілька: /events <code>name URL1 URL2</code>")
-        lines.append("Всі: /events <code>name ALL</code>")
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    traders = get_all_traders()
+    autocopy_traders = [t for t in traders if t.get("autocopy")]
+
+    if not autocopy_traders:
+        await update.message.reply_text("❌ Нема трейдерів з autocopy ON.\nСпочатку /autocopy name ON")
         return
 
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "Використання:\n\n"
-            "/events <code>name URL</code>\n"
-            "/events <code>name URL1 URL2</code>\n"
-            "/events <code>name ALL</code>\n\n"
-            "URL = силка на подію з polymarket.com",
-            parse_mode=ParseMode.HTML,
-        )
-        return
+    # Show current filters + buttons to add/clear
+    lines = ["<b>📅 Event Filters:</b>\n"]
+    buttons = []
 
-    trader_name = context.args[0]
-    rest = context.args[1:]
-
-    trader = find_trader_by_name(trader_name)
-    if not trader:
-        traders = get_all_traders()
-        names = [get_display_name(t) for t in traders]
-        await update.message.reply_text(
-            f"❌ Trader <b>{trader_name}</b> not found.\n\n"
-            f"Доступні: {', '.join(names) if names else 'нема трейдерів'}",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    name = get_display_name(trader)
-
-    if rest[0].upper() == "ALL":
-        set_autocopy_event_slugs(trader["address"], "")
-        await update.message.reply_text(
-            f"✅ <b>{name}</b> — копіюємо ВСІ події",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    # Extract eventSlug from URLs
-    slugs_to_add = []
-    slugs_to_remove = []
-    for arg in rest:
-        # Check if removing (prefix with - or "remove" or "del")
-        is_remove = arg.startswith("-") or arg.startswith("!")
-        clean_arg = arg.lstrip("-!")
-
-        # Match polymarket.com/event/SLUG or polymarket.com/event/SLUG/...
-        match = re.search(r'polymarket\.com/event/([^/?#\s]+)', clean_arg)
-        if match:
-            slug = match.group(1)
-        elif not clean_arg.startswith("http"):
-            slug = clean_arg
+    for t in autocopy_traders:
+        name = get_display_name(t)
+        slugs = get_autocopy_event_slugs(t["address"])
+        if slugs:
+            lines.append(f"<b>{name}:</b>")
+            for s in slugs:
+                lines.append(f"  • <code>{s}</code>")
         else:
-            continue
+            lines.append(f"<b>{name}:</b> всі події")
 
-        if is_remove:
-            slugs_to_remove.append(slug)
-        else:
-            slugs_to_add.append(slug)
+        addr_short = t["address"][:10]
+        buttons.append([
+            InlineKeyboardButton(f"➕ Додати event для {name}", callback_data=f"ev_add:{addr_short}"),
+        ])
+        if slugs:
+            buttons.append([
+                InlineKeyboardButton(f"🗑 Очистити фільтри {name}", callback_data=f"ev_clear:{addr_short}"),
+            ])
 
-    if not slugs_to_add and not slugs_to_remove:
-        await update.message.reply_text(
-            "❌ Не знайшов eventSlug в URL.\n\n"
-            "Приклад:\n"
-            "<code>/events name URL</code> — додати\n"
-            "<code>/events name -URL</code> — видалити\n"
-            "<code>/events name ALL</code> — скинути всі",
-            parse_mode=ParseMode.HTML,
-        )
-        return
+    lines.append("\nНатисни ➕ щоб додати event по URL")
 
-    # Get existing slugs, add new, remove marked
-    existing = get_autocopy_event_slugs(trader["address"])
-    all_slugs = list(set(existing + slugs_to_add))
-    all_slugs = [s for s in all_slugs if s not in slugs_to_remove]
-
-    if all_slugs:
-        set_autocopy_event_slugs(trader["address"], ",".join(all_slugs))
-        lines = [f"✅ <b>{name}</b> — фільтр оновлено:\n"]
-        for s in all_slugs:
-            lines.append(f"  • <code>{s}</code>")
-        if slugs_to_remove:
-            lines.append(f"\n🗑 Видалено: {', '.join(slugs_to_remove)}")
-        lines.append(f"\nКопіюємо тільки ці {len(all_slugs)} подій")
-        lines.append(f"Скинути: /events <code>{trader_name} ALL</code>")
-    else:
-        set_autocopy_event_slugs(trader["address"], "")
-        lines = [f"✅ <b>{name}</b> — фільтри очищені, копіюємо ВСІ події"]
-
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
 
 # ── /remove ─────────────────────────────────────────────────────
@@ -709,6 +635,64 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data or ""
 
+    # ── Event filter: add event ──
+    if data.startswith("ev_add:"):
+        addr_prefix = data[7:]
+        traders = get_all_traders()
+        found = next((t for t in traders if t["address"].startswith(addr_prefix)), None)
+        if found:
+            context.user_data["ev_add_trader"] = found["address"]
+            name = get_display_name(found)
+            await query.edit_message_text(
+                f"📅 <b>Додати event для {name}</b>\n\n"
+                f"Скинь силку на подію з Polymarket:\n"
+                f"<code>https://polymarket.com/event/...</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
+    # ── Event filter: clear all ──
+    if data.startswith("ev_clear:"):
+        addr_prefix = data[9:]
+        traders = get_all_traders()
+        found = next((t for t in traders if t["address"].startswith(addr_prefix)), None)
+        if found:
+            from database import set_autocopy_event_slugs
+            set_autocopy_event_slugs(found["address"], "")
+            name = get_display_name(found)
+            await query.edit_message_text(
+                f"✅ <b>{name}</b> — фільтри очищені\nКопіюємо ВСІ події",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
+    # ── Event filter: remove specific slug ──
+    if data.startswith("ev_rm:"):
+        parts = data[6:].split("|", 1)
+        if len(parts) == 2:
+            addr_prefix, slug = parts
+            traders = get_all_traders()
+            found = next((t for t in traders if t["address"].startswith(addr_prefix)), None)
+            if found:
+                from database import get_autocopy_event_slugs, set_autocopy_event_slugs
+                slugs = get_autocopy_event_slugs(found["address"])
+                slugs = [s for s in slugs if s != slug]
+                set_autocopy_event_slugs(found["address"], ",".join(slugs))
+                name = get_display_name(found)
+                if slugs:
+                    slug_list = "\n".join(f"  • <code>{s}</code>" for s in slugs)
+                    await query.edit_message_text(
+                        f"🗑 Видалено: <code>{slug}</code>\n\n"
+                        f"<b>{name}</b> залишились:\n{slug_list}",
+                        parse_mode=ParseMode.HTML,
+                    )
+                else:
+                    await query.edit_message_text(
+                        f"🗑 Видалено останній фільтр\n<b>{name}</b> — копіюємо ВСІ події",
+                        parse_mode=ParseMode.HTML,
+                    )
+        return
+
     # ── Remove via button ──
     if data.startswith("rm:"):
         addr_prefix = data[3:]
@@ -990,6 +974,54 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Handle custom amount typed by user ──────────────────────────
 @owner_only
 async def custom_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ── Handle Polymarket URL for event filter ──
+    ev_trader = context.user_data.get("ev_add_trader")
+    if ev_trader and update.message and update.message.text:
+        import re
+        text = update.message.text.strip()
+        match = re.search(r'polymarket\.com/event/([^/?#\s]+)', text)
+        if match:
+            slug = match.group(1)
+            from database import get_autocopy_event_slugs, set_autocopy_event_slugs
+            existing = get_autocopy_event_slugs(ev_trader)
+            if slug not in existing:
+                existing.append(slug)
+            set_autocopy_event_slugs(ev_trader, ",".join(existing))
+
+            traders = get_all_traders()
+            found = next((t for t in traders if t["address"] == ev_trader), None)
+            name = get_display_name(found) if found else ev_trader[:10]
+
+            # Build buttons for each slug (to remove individually)
+            buttons = []
+            for s in existing:
+                addr_short = ev_trader[:10]
+                buttons.append([
+                    InlineKeyboardButton(f"🗑 {s[:40]}", callback_data=f"ev_rm:{addr_short}|{s[:50]}"),
+                ])
+            buttons.append([
+                InlineKeyboardButton(f"➕ Додати ще event", callback_data=f"ev_add:{ev_trader[:10]}"),
+            ])
+
+            await update.message.reply_text(
+                f"✅ <b>Event додано для {name}!</b>\n\n"
+                f"<code>{slug}</code>\n\n"
+                f"Активні фільтри ({len(existing)}):\n" +
+                "\n".join(f"  • <code>{s}</code>" for s in existing),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+            context.user_data.pop("ev_add_trader", None)
+            return
+        elif "polymarket" in text.lower():
+            await update.message.reply_text(
+                "❌ Не знайшов event slug в URL.\n\n"
+                "Потрібна силка виду:\n"
+                "<code>https://polymarket.com/event/elon-musk-tweets-...</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
     trade_info = context.user_data.get("pending_copy")
     if not trade_info:
         return
