@@ -760,18 +760,19 @@ async def _cancel_pending_copies(bot: Bot, trader_address: str, condition_id: st
 # ── Background order checker ─────────────────────────────────────
 
 async def check_pending_orders(bot: Bot):
-    """Background task: check PENDING orders every 30s.
-    - MATCHED → OPEN (+ check if trader already sold → auto-sell)
-    - LIVE > 2 min → cancel + CANCELLED
+    """Background task: check PENDING orders every 10s.
+    - MATCHED → OPEN (notify + channel)
+    - LIVE + trader already sold this token → cancel (no point entering)
+    - Other status → cancel
     """
     from database import (
         get_all_pending_copy_trades, update_copy_trade_status,
-        has_trader_sold, has_trader_sold_token, get_all_traders,
+        has_trader_sold_token, get_all_traders,
     )
     from trading import check_order_status, cancel_order
 
-    logger.info("Order checker started (30s interval)")
-    await asyncio.sleep(30)  # Wait before first check
+    logger.info("Order checker started (10s interval)")
+    await asyncio.sleep(10)
 
     while True:
         try:
@@ -786,7 +787,6 @@ async def check_pending_orders(bot: Bot):
 
                 status = check_order_status(order_id)
                 status_lower = status.lower() if status else ""
-                age = time.time() - int(p.get("timestamp", time.time()))
 
                 if status_lower == "matched":
                     # Order filled! Move to OPEN
@@ -805,7 +805,7 @@ async def check_pending_orders(bot: Bot):
                         parse_mode=ParseMode.HTML,
                     )
 
-                    # NOW post to channel — only after confirmed fill
+                    # Post to channel after confirmed fill
                     await _send_to_channel(bot,
                         f"🟢 <b>AUTOCOPY BUY</b>\n\n"
                         f"📌 <b>{_esc(p.get('title', '?'))}</b>\n"
@@ -814,24 +814,29 @@ async def check_pending_orders(bot: Bot):
                         f"👤 Copying: {trader_name}"
                     )
 
-                    # Don't auto-sell here. Let normal polling detect trader's SELL
-                    # and handle it proportionally via _auto_sell_copies.
-                    logger.info("Order filled, waiting for trader sell signal via poll")
-
-                elif status_lower == "live" and age > 120:
-                    # Still live after 2 min → cancel
-                    cancel_order(order_id)
-                    update_copy_trade_status(p["id"], "CANCELLED")
-                    logger.info("PENDING → CANCELLED (timeout): %s", p.get("title", "?")[:40])
+                elif status_lower == "live":
+                    # Check if trader already sold — no point entering
+                    token_id = p.get("token_id", "")
+                    if token_id and has_trader_sold_token(p["trader_address"], token_id):
+                        cancel_order(order_id)
+                        update_copy_trade_status(p["id"], "CANCELLED")
+                        logger.info("PENDING → CANCELLED (trader sold): %s", p.get("title", "?")[:40])
+                        await bot.send_message(
+                            chat_id=OWNER_ID,
+                            text=(
+                                f"🚫 <b>Лімітку скасовано</b> — трейдер вже продав\n"
+                                f"📌 {_esc(p.get('title', '?'))[:50]}"
+                            ),
+                            parse_mode=ParseMode.HTML,
+                        )
 
                 elif status_lower not in ("live", "matched", ""):
-                    # Unexpected status (cancelled externally, expired, etc)
                     update_copy_trade_status(p["id"], "CANCELLED")
                     logger.info("PENDING → CANCELLED (status %s): %s", status, p.get("title", "?")[:40])
 
-                await asyncio.sleep(0.3)  # Don't hammer API
+                await asyncio.sleep(0.3)
 
         except Exception as e:
             logger.error(f"Order checker error: {e}")
 
-        await asyncio.sleep(30)
+        await asyncio.sleep(10)
