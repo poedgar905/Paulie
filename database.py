@@ -651,3 +651,15 @@ def set_autocopy_event_slugs(trader_address: str, slugs: str):
     )
     conn.commit()
     conn.close()
+
+
+def get_token_total_spent(trader_address: str, token_id: str) -> float:
+    """Get total USDC already spent on this token_id (OPEN + PENDING copy trades)."""
+    conn = get_db()
+    row = conn.execute(
+        """SELECT COALESCE(SUM(usdc_spent), 0) as total FROM copy_trades
+           WHERE trader_address = ? AND token_id = ? AND status IN ('OPEN', 'PENDING')""",
+        (trader_address.lower(), token_id)
+    ).fetchone()
+    conn.close()
+    return float(row["total"]) if row else 0
