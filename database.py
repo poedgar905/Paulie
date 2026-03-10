@@ -635,8 +635,10 @@ def get_autocopy_event_slugs(trader_address: str) -> list[str]:
         (trader_address.lower(),)
     ).fetchone()
     conn.close()
-    if row and row.get("autocopy_events"):
-        return [e.strip() for e in row["autocopy_events"].split(",") if e.strip()]
+    if row:
+        val = row["autocopy_events"] if "autocopy_events" in row.keys() else None
+        if val:
+            return [e.strip() for e in val.split(",") if e.strip()]
     return []
 
 
