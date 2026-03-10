@@ -140,10 +140,11 @@ def get_token_id_for_market(condition_id: str, outcome: str) -> str | None:
 # ── BUY — FOK (Fill-or-Kill) ────────────────────────────────────
 
 def place_fok_buy(token_id: str, trader_price: float, amount_usdc: float,
-                  condition_id: str = "", slippage: float = 0.015) -> dict | None:
+                  condition_id: str = "", slippage: float = 0.01) -> dict | None:
     """
-    FOK buy at trader_price + slippage.
-    Either fills instantly or cancels — no capital lock.
+    Limit buy at trader_price + 1¢.
+    GTC order — monitored by order checker every 10s.
+    If trader sells before fill → cancel. If fills → hold until trader sells.
     """
     client = _get_client()
     if not client:
@@ -159,37 +160,32 @@ def place_fok_buy(token_id: str, trader_price: float, amount_usdc: float,
         if buy_price <= 0:
             return None
 
-        size = math.floor(amount_usdc * 1.02 / buy_price * 100) / 100
+        size = math.ceil(amount_usdc * 1.02 / buy_price * 100) / 100
         if size < 5:
             size = 5.0
-        size = round(size, 2)  # strict 2 decimal places
+
+        # Polymarket minimum order = $1
+        actual_cost = size * buy_price
+        if actual_cost < 1.05:
+            size = math.ceil(1.05 / buy_price * 100) / 100
 
         neg_risk = get_neg_risk(condition_id) if condition_id else False
 
         bal = get_balance()
         actual_cost = round(size * buy_price, 2)
-        logger.info("FOK BUY: %.2f¢ (+%.1f¢ slip), %s sh, $%.2f, bal=$%s, neg_risk=%s",
-                     buy_price * 100, slippage * 100, size, actual_cost,
+        logger.info("LIMIT BUY: %.2f¢ (+1¢), %s sh, $%.2f, bal=$%s, neg_risk=%s",
+                     buy_price * 100, size, actual_cost,
                      f"{bal:.2f}" if bal else "?", neg_risk)
 
         order_args = OrderArgs(price=buy_price, size=size, side=BUY, token_id=token_id)
         signed = client.create_order(order_args)
 
-        # Try FOK first, fallback to GTC if FOK not supported
-        resp = None
         try:
-            resp = client.post_order(signed, orderType=OrderType.FOK)
-        except (TypeError, AttributeError):
-            try:
-                resp = client.post_order(signed, "FOK")
-            except Exception:
-                logger.warning("FOK not available, falling back to GTC")
-                try:
-                    resp = client.post_order(signed, orderType=OrderType.GTC)
-                except TypeError:
-                    resp = client.post_order(signed, OrderType.GTC)
+            resp = client.post_order(signed, orderType=OrderType.GTC)
+        except TypeError:
+            resp = client.post_order(signed, OrderType.GTC)
 
-        logger.info("FOK BUY resp: %s", resp)
+        logger.info("LIMIT BUY resp: %s", resp)
 
         if not resp:
             return None
@@ -203,18 +199,16 @@ def place_fok_buy(token_id: str, trader_price: float, amount_usdc: float,
                 "status": "FILLED", "response": resp,
             }
         elif status == "live":
-            # GTC fallback — order is pending
             return {
                 "order_id": order_id, "price": buy_price, "size": size,
                 "status": "PENDING", "response": resp,
             }
         else:
-            # FOK killed — no fill, no capital lock
-            logger.info("FOK killed (no liquidity at %.2f¢)", buy_price * 100)
+            logger.info("Order rejected: %s", status)
             return None
 
     except Exception as e:
-        logger.error("FOK BUY error: %s", e)
+        logger.error("LIMIT BUY error: %s", e)
         return None
 
 
