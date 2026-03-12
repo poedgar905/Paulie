@@ -1,6 +1,7 @@
 """
 Trading module v2 — FOK buy, smart sell with retry, balance checks.
 """
+import asyncio
 import logging
 import math
 import time
@@ -214,12 +215,12 @@ def place_fok_buy(token_id: str, trader_price: float, amount_usdc: float,
 
 # ── SELL — Smart with retry ──────────────────────────────────────
 
-def smart_sell(token_id: str, shares: float, trader_sell_price: float,
-               condition_id: str = "") -> dict | None:
+async def smart_sell(token_id: str, shares: float, trader_sell_price: float,
+                     condition_id: str = "") -> dict | None:
     """
     Smart sell with 3 levels:
     1. Limit sell at trader_price - 2¢ (try to get close to his price)
-    2. If no fill in 10s → lower by 5¢
+    2. If no fill in 8s → lower by 5¢
     3. If still no fill → market sell (1¢)
     """
     # First check real balance
@@ -245,10 +246,10 @@ def smart_sell(token_id: str, shares: float, trader_sell_price: float,
             logger.info("SELL L1 filled @ %.2f¢", price1 * 100)
             return result
 
-        # Wait 8 seconds for fill
+        # Wait 8 seconds for fill (async — doesn't block event loop)
         order_id = result.get("order_id", "") if result else ""
         if order_id:
-            time.sleep(8)
+            await asyncio.sleep(8)
             status = check_order_status(order_id)
             if status and status.lower() == "matched":
                 logger.info("SELL L1 filled after wait @ %.2f¢", price1 * 100)
@@ -266,7 +267,7 @@ def smart_sell(token_id: str, shares: float, trader_sell_price: float,
 
         order_id = result.get("order_id", "") if result else ""
         if order_id:
-            time.sleep(5)
+            await asyncio.sleep(5)
             status = check_order_status(order_id)
             if status and status.lower() == "matched":
                 logger.info("SELL L2 filled after wait @ %.2f¢", price2 * 100)
