@@ -228,6 +228,9 @@ def calc_autocopy_amount(trader_usdc: float, trader_address: str, price: float =
 
 pending_copy_data: dict[str, dict] = {}
 
+# Lock set to prevent duplicate sells for the same token_id
+_selling_locks: set[str] = set()
+
 
 def _clean_pending_data():
     """Remove entries older than 1 hour."""
@@ -682,11 +685,20 @@ async def _auto_sell_copies(bot: Bot, trader_address: str, condition_id: str, ou
             total_shares = float(copy["shares"])
             invested = float(copy["usdc_spent"])
 
-            shares_to_sell = round(total_shares * sell_fraction, 2)
-            if shares_to_sell < 0.1:
-                shares_to_sell = total_shares
+            # FIX 3: Race condition lock — skip if already selling this token_id
+            if token_id in _selling_locks:
+                logger.info("Sell lock active for token %s, skipping duplicate", token_id[:20])
+                continue
+            _selling_locks.add(token_id)
 
-            result = smart_sell(token_id, shares_to_sell, sell_price, condition_id)
+            try:
+                shares_to_sell = round(total_shares * sell_fraction, 2)
+                if shares_to_sell < 0.1:
+                    shares_to_sell = total_shares
+
+                result = await smart_sell(token_id, shares_to_sell, sell_price, condition_id)
+            finally:
+                _selling_locks.discard(token_id)
 
             if result and result.get("status") == "ghost":
                 # No shares on-chain — close ghost trade
@@ -695,13 +707,22 @@ async def _auto_sell_copies(bot: Bot, trader_address: str, condition_id: str, ou
                 continue
 
             if result:
-                sell_usdc = shares_to_sell * sell_price
+                # FIX 1: Use actual takingAmount from API response, not trader's price
+                resp = result.get("response", {})
+                taking = resp.get("takingAmount")
+                if taking:
+                    actual_sell_usdc = float(taking)
+                    actual_sell_price = actual_sell_usdc / shares_to_sell if shares_to_sell > 0 else sell_price
+                else:
+                    actual_sell_price = result.get("price", sell_price)
+                    actual_sell_usdc = shares_to_sell * actual_sell_price
+
                 cost_fraction = invested * sell_fraction
-                pnl_usdc = sell_usdc - cost_fraction
+                pnl_usdc = actual_sell_usdc - cost_fraction
                 pnl_pct = (pnl_usdc / cost_fraction * 100) if cost_fraction > 0 else 0
 
                 if sell_fraction >= 0.95:
-                    close_copy_trade(copy["id"], sell_price, sell_usdc, sell_ts,
+                    close_copy_trade(copy["id"], actual_sell_price, actual_sell_usdc, sell_ts,
                                    pnl_usdc=pnl_usdc, pnl_pct=pnl_pct)
                     action = "SOLD ALL"
                 else:
@@ -717,11 +738,11 @@ async def _auto_sell_copies(bot: Bot, trader_address: str, condition_id: str, ou
                 msg = (
                     f"🤖 <b>AUTO-{action}</b>\n\n"
                     f"📌 <b>{_esc(copy.get('title', '?'))}</b>\n"
-                    f"🎯 {outcome} @ {_price(sell_price)}\n"
-                    f"💵 {_usd(sell_usdc)} ({_shares(shares_to_sell)} sh)\n"
+                    f"🎯 {outcome} @ {_price(actual_sell_price)}\n"
+                    f"💵 {_usd(actual_sell_usdc)} ({_shares(shares_to_sell)} sh)\n"
                     f"👤 Trader: {trader_name} sold {_shares(trader_sell_shares)}/{_shares(trader_total_shares)}\n\n"
                     f"📊 <b>P&L:</b>\n"
-                    f"   {_price(copy['buy_price'])} → {_price(sell_price)}\n"
+                    f"   {_price(copy['buy_price'])} → {_price(actual_sell_price)}\n"
                     f"   {emoji} {sign}{_usd(pnl_usdc)} ({sign}{pnl_pct:.1f}%)\n"
                     f"   ⏳ {hold}"
                 )
@@ -739,6 +760,7 @@ async def _auto_sell_copies(bot: Bot, trader_address: str, condition_id: str, ou
                     parse_mode=ParseMode.HTML,
                 )
         except Exception as e:
+            _selling_locks.discard(copy.get("token_id", ""))
             logger.error(f"Auto-sell error: {e}")
 
 
