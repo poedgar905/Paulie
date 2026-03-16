@@ -365,6 +365,43 @@ async def events_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ── /snipe90 ────────────────────────────────────────────────────
+@owner_only
+async def snipe90_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manage 90¢ sniper on Elon tweet markets."""
+    from sniper90 import (
+        fetch_elon_events, get_market_prices, fetch_event_markets,
+        add_snipe_event, remove_snipe_event, get_enabled_snipe_events,
+        get_sniper90_status,
+    )
+
+    if not context.args:
+        # Show status + available events
+        status = get_sniper90_status()
+        events = fetch_elon_events()
+
+        buttons = []
+        enabled = get_enabled_snipe_events()
+
+        if events:
+            status += "\n\n<b>📋 Доступні events:</b>\n"
+            for ev in events[:10]:
+                slug = ev.get("slug", "")
+                title = ev.get("title", slug)[:50]
+                is_on = slug in enabled
+                emoji = "✅" if is_on else "⬜"
+                status += f"\n{emoji} {title}"
+                cb = f"s90_off:{slug[:50]}" if is_on else f"s90_on:{slug[:50]}"
+                btn_text = f"{'🔴 OFF' if is_on else '🟢 ON'} {title[:30]}"
+                buttons.append([InlineKeyboardButton(btn_text, callback_data=cb)])
+
+        markup = InlineKeyboardMarkup(buttons) if buttons else None
+        await update.message.reply_text(status, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    await update.message.reply_text("Використовуй /snipe90 без аргументів — обирай кнопками")
+
+
 # ── /remove ─────────────────────────────────────────────────────
 @owner_only
 async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -730,6 +767,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"🗑 Видалено останній фільтр\n<b>{name}</b> — копіюємо ВСІ події",
                         parse_mode=ParseMode.HTML,
                     )
+        return
+
+    # ── Snipe90 toggle ──
+    if data.startswith("s90_on:"):
+        slug = data[7:]
+        from sniper90 import add_snipe_event
+        add_snipe_event(slug)
+        await query.edit_message_text(
+            f"✅ <b>Sniper 90¢ ON</b>\n<code>{slug}</code>\n\n"
+            f"Лімітки будуть поставлені за 48h до кінця",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data.startswith("s90_off:"):
+        slug = data[8:]
+        from sniper90 import remove_snipe_event
+        remove_snipe_event(slug)
+        await query.edit_message_text(
+            f"🔴 <b>Sniper 90¢ OFF</b>\n<code>{slug}</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     # ── Remove via button ──
@@ -1113,12 +1172,18 @@ async def post_init(app: Application):
         BotCommand("cleanup", "🧹 Видалити привидні трейди"),
         BotCommand("autocopy", "🤖 Автокопітрейдинг"),
         BotCommand("events", "📅 Фільтр подій для копі"),
+        BotCommand("snipe90", "🎯 Sniper 90¢ Маск"),
         BotCommand("status", "📊 Статус бота"),
     ])
 
     # Start poller
     asyncio.create_task(poll_traders(app.bot))
     logger.info("Poller task created")
+
+    # Start sniper 90¢
+    from sniper90 import sniper90_loop
+    asyncio.create_task(sniper90_loop(app.bot))
+    logger.info("Sniper 90¢ task created")
 
     # Start order checker (PENDING → OPEN/CANCELLED)
     from poller import check_pending_orders
@@ -2025,6 +2090,7 @@ def main():
     app.add_handler(CommandHandler("nick", nick_cmd))
     app.add_handler(CommandHandler("autocopy", autocopy_cmd))
     app.add_handler(CommandHandler("events", events_cmd))
+    app.add_handler(CommandHandler("snipe90", snipe90_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("check", check_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
